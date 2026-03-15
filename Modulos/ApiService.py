@@ -412,6 +412,15 @@ class ApiService:
 
         else:
             return "API Offline", "Offline", None
+
+    def get_live_sensors(self):
+        """Retorna una copia thread-safe del último snapshot de sensores IoT."""
+        try:
+            with self._live_sensors_lock:
+                return dict(self._live_sensors)
+        except Exception as e:
+            logger.warning(f"No se pudo obtener snapshot de sensores: {e}")
+            return {}
         
     # ================= ENTRY POINT =================
     def main():

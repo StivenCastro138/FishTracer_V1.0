@@ -389,25 +389,13 @@ class DatabaseManager:
             conn = sqlite3.connect(self.db_path)
             cursor = conn.cursor()
             
-            query = f"SELECT {MEASUREMENT_COLUMNS_STR} FROM measurements WHERE 1=1"
-            params: List[Any] = []
-            
-            if filter_type and filter_type not in ["Todas", "Todos", None]:
-                query += " AND measurement_type = ?"
-                params.append(filter_type)
-            
-            if date_start:
-                query += " AND date(timestamp) >= date(?)"
-                params.append(date_start)
-            
-            if date_end:
-                query += " AND date(timestamp) <= date(?)"
-                params.append(date_end)
-            
-            if search_query:
-                query += " AND (fish_id LIKE ? OR notes LIKE ? OR CAST(id AS TEXT) LIKE ?)"
-                wildcard = f"%{search_query}%"
-                params.extend([wildcard, wildcard, wildcard])
+            where_clause, params = self._build_measurements_filters(
+                search_query=search_query,
+                filter_type=filter_type,
+                date_start=date_start,
+                date_end=date_end,
+            )
+            query = f"SELECT {MEASUREMENT_COLUMNS_STR} FROM measurements WHERE {where_clause}"
             
             query += " ORDER BY timestamp DESC"
             
@@ -423,6 +411,128 @@ class DatabaseManager:
         except Exception as e:
             logger.error("Error en get_filtered_measurements", exc_info=True)
             return []
+
+    def get_filtered_measurements_count(
+        self,
+        search_query: Optional[str] = None,
+        filter_type: Optional[str] = None,
+        date_start: Optional[str] = None,
+        date_end: Optional[str] = None,
+    ) -> int:
+        """Retorna el total de registros para los filtros aplicados."""
+        try:
+            conn = sqlite3.connect(self.db_path)
+            cursor = conn.cursor()
+
+            where_clause, params = self._build_measurements_filters(
+                search_query=search_query,
+                filter_type=filter_type,
+                date_start=date_start,
+                date_end=date_end,
+            )
+
+            cursor.execute(
+                f"SELECT COUNT(*) FROM measurements WHERE {where_clause}",
+                params,
+            )
+            result = cursor.fetchone()
+            conn.close()
+            return int(result[0]) if result else 0
+        except Exception:
+            logger.error("Error en get_filtered_measurements_count", exc_info=True)
+            return 0
+
+    def get_filtered_measurements_quick_totals(
+        self,
+        search_query: Optional[str] = None,
+        filter_type: Optional[str] = None,
+        date_start: Optional[str] = None,
+        date_end: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """Retorna totales rápidos para la vista de historial."""
+        try:
+            conn = sqlite3.connect(self.db_path)
+            cursor = conn.cursor()
+
+            where_clause, params = self._build_measurements_filters(
+                search_query=search_query,
+                filter_type=filter_type,
+                date_start=date_start,
+                date_end=date_end,
+            )
+
+            cursor.execute(
+                f'''
+                SELECT
+                    COUNT(*) AS total,
+                    AVG(CASE WHEN length_cm > 0 THEN length_cm END) AS avg_length,
+                    AVG(CASE WHEN weight_g > 0 THEN weight_g END) AS avg_weight,
+                    SUM(CASE WHEN measurement_type LIKE 'manual%' THEN 1 ELSE 0 END) AS manual_total,
+                    SUM(CASE WHEN measurement_type NOT LIKE 'manual%' THEN 1 ELSE 0 END) AS auto_total
+                FROM measurements
+                WHERE {where_clause}
+                ''',
+                params,
+            )
+
+            row = cursor.fetchone()
+            conn.close()
+
+            if not row:
+                return {
+                    "total": 0,
+                    "avg_length": 0.0,
+                    "avg_weight": 0.0,
+                    "manual_total": 0,
+                    "auto_total": 0,
+                }
+
+            return {
+                "total": int(row[0] or 0),
+                "avg_length": float(row[1] or 0.0),
+                "avg_weight": float(row[2] or 0.0),
+                "manual_total": int(row[3] or 0),
+                "auto_total": int(row[4] or 0),
+            }
+        except Exception:
+            logger.error("Error en get_filtered_measurements_quick_totals", exc_info=True)
+            return {
+                "total": 0,
+                "avg_length": 0.0,
+                "avg_weight": 0.0,
+                "manual_total": 0,
+                "auto_total": 0,
+            }
+
+    def _build_measurements_filters(
+        self,
+        search_query: Optional[str] = None,
+        filter_type: Optional[str] = None,
+        date_start: Optional[str] = None,
+        date_end: Optional[str] = None,
+    ) -> Tuple[str, List[Any]]:
+        """Construye la cláusula WHERE y sus parámetros."""
+        query = "1=1"
+        params: List[Any] = []
+
+        if filter_type and filter_type not in ["Todas", "Todos", None]:
+            query += " AND measurement_type = ?"
+            params.append(filter_type)
+
+        if date_start:
+            query += " AND date(timestamp) >= date(?)"
+            params.append(date_start)
+
+        if date_end:
+            query += " AND date(timestamp) <= date(?)"
+            params.append(date_end)
+
+        if search_query:
+            query += " AND (fish_id LIKE ? OR notes LIKE ? OR CAST(id AS TEXT) LIKE ?)"
+            wildcard = f"%{search_query}%"
+            params.extend([wildcard, wildcard, wildcard])
+
+        return query, params
     
     def get_today_measurements_count(self) -> int:
         """Cuenta mediciones del día actual."""
@@ -436,23 +546,6 @@ class DatabaseManager:
             return count
         except Exception:
             return 0
-    
-    def get_field_value(self, measurement_row, column_name, default=None):
-        """Recupera un valor de la tupla de forma segura usando el nombre de columna"""
-        try:
-            if not hasattr(self, '_column_cache') or not self._column_cache:
-                with sqlite3.connect(self.db_path) as conn:
-                    cursor = conn.cursor()
-                    cursor.execute("PRAGMA table_info(measurements)")
-                    self._column_cache = {col[1]: i for i, col in enumerate(cursor.fetchall())}
-            
-            idx = self._column_cache.get(column_name)
-            if idx is not None and idx < len(measurement_row):
-                val = measurement_row[idx]
-                return val if val is not None else default
-            return default
-        except:
-            return default
         
     def save_calibration(self, scale_lat_front: float, scale_lat_back: float, 
                          scale_top_front: float, scale_top_back: float, 

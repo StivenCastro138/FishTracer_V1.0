@@ -187,6 +187,16 @@ class ImageViewerDialog(QDialog):
         self.btn_open_external.clicked.connect(self.open_external_viewer)
         actions_layout.addWidget(self.btn_open_external)
 
+        self.btn_copy_path = QPushButton("Copiar ruta")
+        self.btn_copy_path.setProperty("class", "info")
+        self.btn_copy_path.style().unpolish(self.btn_copy_path)
+        self.btn_copy_path.style().polish(self.btn_copy_path)
+        self.btn_copy_path.setCursor(Qt.PointingHandCursor)
+        self.btn_copy_path.setMinimumHeight(45)
+        self.btn_copy_path.setToolTip("Copia la ruta completa de la imagen al portapapeles.")
+        self.btn_copy_path.clicked.connect(self._copy_image_path)
+        actions_layout.addWidget(self.btn_copy_path)
+
         actions_layout.addStretch()
 
         if self.is_dual_format and self.advanced_detector and self.advanced_detector.is_ready:
@@ -224,6 +234,14 @@ class ImageViewerDialog(QDialog):
         
         self.main_layout.addWidget(actions_group)
         
+    def _copy_image_path(self):
+        """Copia la ruta de la imagen al portapapeles."""
+        path = self.image_path_combined
+        if path and os.path.exists(path):
+            QApplication.clipboard().setText(os.path.abspath(path))
+        else:
+            QMessageBox.warning(self, "Archivo no encontrado", "La imagen ya no existe en el disco.")
+
     def open_external_viewer(self):
         """Abre la imagen usando el visor predeterminado del SO"""
         path = self.image_path_combined

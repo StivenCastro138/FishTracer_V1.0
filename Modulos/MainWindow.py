@@ -21,6 +21,7 @@ import logging
 import platform
 import subprocess
 import urllib.request
+from collections import deque
 from datetime import datetime, timedelta
 import numpy as np
 import cv2
@@ -34,7 +35,8 @@ from PySide6.QtCore import (
     QPropertyAnimation, QEasingCurve, QAbstractAnimation
 )
 from PySide6.QtGui import (
-    QImage, QPixmap, QColor, QFont, QIcon, QIntValidator, QAction
+    QImage, QPixmap, QColor, QFont, QIcon, QIntValidator, QAction,
+    QPainter, QPen
 )
 from PySide6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QSystemTrayIcon,
@@ -72,6 +74,7 @@ from .FishDetector import FishDetector
 from .FishTracker import FishTracker
 from .FrameProcessor import FrameProcessor
 from .StatusBar import StatusBar
+from .SensorBar import SensorTopBar
 from .MeasurementValidator import MeasurementValidator
 from .EditMeasurementDialog import EditMeasurementDialog
 from .BiometryService import BiometryService
@@ -81,12 +84,37 @@ from .FishAnatomyValidator import FishAnatomyValidator
 from .CaptureDecisionDialog import CaptureDecisionDialog
 from .OptimizedCamera import OptimizedCamera
 from .ApiService import ApiService
-from Herramientas.mobil import start_flask_server, mobile_capture_queue, get_local_ip
+from Herramientas.mobil import (
+    start_flask_server,
+    mobile_capture_queue,
+    get_local_ip,
+    build_mobile_access_url,
+)
 
 logger = logging.getLogger(__name__)
 
 os.environ["OPENCV_VIDEOIO_DEBUG"] = "0"
 os.environ["OPENCV_LOG_LEVEL"] = "OFF"
+
+
+class CameraAspectLabel(QLabel):
+    """QLabel que mantiene relación de aspecto fija (16:9 por defecto)."""
+
+    def __init__(self, ratio_w: int = 16, ratio_h: int = 9, parent=None):
+        super().__init__(parent)
+        self._ratio_w = max(1, ratio_w)
+        self._ratio_h = max(1, ratio_h)
+        self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)
+
+    def hasHeightForWidth(self) -> bool:
+        return True
+
+    def heightForWidth(self, width: int) -> int:
+        return max(1, int(width * self._ratio_h / self._ratio_w))
+
+    def sizeHint(self) -> QSize:
+        base_w = 640
+        return QSize(base_w, self.heightForWidth(base_w))
 
 class MainWindow(QMainWindow):
 
@@ -142,7 +170,58 @@ class MainWindow(QMainWindow):
         self.scale_back_top = Config.SCALE_TOP_BACK
         self.preview_fps = Config.PREVIEW_FPS
         self.processing_lock = False  
-        self.current_tab = 1          
+        self.current_tab = 0
+        self.tablet_mode_enabled = False
+        self._pre_tablet_density = "Normal"
+        self._pre_tablet_font = 11
+        self._camera_read_failures = 0
+        self._left_signal_failures = 0
+        self._top_signal_failures = 0
+        self._cam_health_left = "warning"
+        self._cam_health_top = "warning"
+        self._auto_reconnect_attempts = 0
+        self._auto_reconnect_running = False
+        self._microcuts_left = deque()
+        self._microcuts_top = deque()
+        self.settings_dirty = False
+        self._settings_change_guard = False
+        self._fallback_sensor_cache = {}
+        self._last_fallback_sensor_pull = 0.0
+        self.sensor_env_ranges = {
+            "temp_agua": (18.0, 32.0),
+            "ph": (6.5, 8.5),
+            "cond": (100.0, 2000.0),
+            "turb": (0.0, 100.0),
+            "do": (4.0, 14.0),
+        }
+        self.quick_notes = [
+            "Sin observaciones",
+            "Pez en buen estado",
+            "Leve movimiento durante captura",
+            "Revisar en próxima medición"
+        ]
+        self._general_defaults = {
+            'theme': 'Sistema',
+            'font_size': '11',
+            'density': 'Normal',
+            'animations': 'Normales',
+            'high_contrast': False,
+            'cam_left_index': 1,
+            'cam_top_index': 0,
+            'min_contour_area': 1500,
+            'max_contour_area': 20000,
+            'confidence_threshold': 0.6,
+            'min_length_cm': 4.0,
+            'max_length_cm': 50.0,
+            'sensor_env_ranges': {
+                'temp_agua': (18.0, 32.0),
+                'ph': (6.5, 8.5),
+                'cond': (100.0, 2000.0),
+                'turb': (0.0, 100.0),
+                'do': (4.0, 14.0),
+            },
+        }
+        self._quick_note_combos = []
 
         # INICIALIZAR UI
         self.setWindowIcon(QIcon("logo.ico"))
@@ -166,15 +245,18 @@ class MainWindow(QMainWindow):
         self.processor.result_ready.connect(self.on_processing_complete)
         
         # Conexiones de la API y Salud del Sistema
-        self.ram_timer.timeout.connect(self.status_bar.update_system_info)
-        self.ram_timer.timeout.connect(self.update_api_status_ui)      # Actualiza texto URL
-        self.ram_timer.timeout.connect(self.check_api_health_for_tray) # Inicia parpadeo si falla
+        # NOTA: StatusBar tiene su propio timer_hw de 1s para CPU/RAM/GPU.
+        # update_api_status_ui consolida: actualizar StatusBar + lógica de alerta en bandeja.
+        self.ram_timer.timeout.connect(self.update_api_status_ui)
+        self.sensor_bar_timer = QTimer(self)
+        self.sensor_bar_timer.timeout.connect(self.update_environment_topbar)
         
         # Conexión del motor de parpadeo
         self.alert_timer.timeout.connect(self.toggle_alert_icon)
         
         # 3. FINALMENTE INICIAMOS LOS TIMERS
         self.ram_timer.start(5000)
+        self.sensor_bar_timer.start(1500)
         
         self.save_sound = QSoundEffect(self)
         self.save_sound.setSource(QUrl.fromLocalFile(os.path.abspath("save_ok.wav")))
@@ -226,7 +308,8 @@ class MainWindow(QMainWindow):
         self.timer.timeout.connect(self.update_frames)
 
         self.processor.start()
-        self.start_cameras()
+        cameras_ok = self.start_cameras()
+        self._configure_camera_tabs(cameras_ok, choose_startup=True)
         self.status_bar.set_status("Sistema listo. Esperando captura")
         
     def init_ui(self):
@@ -253,6 +336,11 @@ class MainWindow(QMainWindow):
         
         settings_tab = self.create_settings_tab()
         self.tabs.addTab(settings_tab, " Configuración")
+
+        self.sensor_top_bar = SensorTopBar(self)
+        self.sensor_top_bar.btn_tablet.toggled.connect(self.toggle_tablet_mode)
+        self.sensor_top_bar.set_ranges(self.sensor_env_ranges)
+        self.tabs.setCornerWidget(self.sensor_top_bar, Qt.TopRightCorner)
         
         self.status_bar = StatusBar(self)
         main_layout.addWidget(self.status_bar)
@@ -275,11 +363,116 @@ class MainWindow(QMainWindow):
         self.tabs.tabBar().setCursor(Qt.PointingHandCursor)
            
     def update_api_status_ui(self):
-        """Sincroniza el estado del servicio API con el botón de la StatusBar"""
-        if hasattr(self, 'api_service'):
-            text, state, url = self.api_service.get_status_info()
-            
-            self.status_bar.update_api_status(text, state, url)
+        """Sincroniza la API con StatusBar y gestiona la alerta de bandeja.
+        Consolida update_api_status_ui + check_api_health_for_tray en una sola
+        llamada a get_status_info() por tick del timer.
+        """
+        if not (hasattr(self, 'api_service') and self.api_service):
+            return
+
+        text, state, url = self.api_service.get_status_info()
+        self.status_bar.update_api_status(text, state, url)
+
+        # Alerta de bandeja: parpadeo si no hay túnel público activo
+        api_ok = state == "success" and url is not None
+        if not api_ok:
+            if not self.alert_timer.isActive():
+                logger.warning("API sin túnel público. Activando alerta visual.")
+                self.alert_timer.start(600)
+        else:
+            if self.alert_timer.isActive():
+                self.alert_timer.stop()
+
+    def update_environment_topbar(self):
+        """Actualiza la barra superior con variables ambientales recientes."""
+        if not hasattr(self, "sensor_top_bar"):
+            return
+
+        sensor_data = {}
+
+        if hasattr(self, "api_service") and self.api_service and hasattr(self.api_service, "get_live_sensors"):
+            sensor_data = self.api_service.get_live_sensors() or {}
+        else:
+            now = time.time()
+            if now - self._last_fallback_sensor_pull > 8.0:
+                self._fallback_sensor_cache = SensorService.get_water_quality_data() or {}
+                self._last_fallback_sensor_pull = now
+            sensor_data = self._fallback_sensor_cache
+
+        self.sensor_top_bar.update_values(sensor_data)
+
+    def _apply_sensor_ranges_from_ui(self):
+        """Sincroniza rangos de alerta ambiental desde la pestaña Configuración."""
+        if not all(hasattr(self, name) for name in (
+            "spin_env_temp_min", "spin_env_temp_max",
+            "spin_env_ph_min", "spin_env_ph_max",
+            "spin_env_cond_min", "spin_env_cond_max",
+            "spin_env_turb_min", "spin_env_turb_max",
+            "spin_env_do_min", "spin_env_do_max",
+        )):
+            return
+
+        def _ordered(a: float, b: float) -> tuple[float, float]:
+            return (a, b) if a <= b else (b, a)
+
+        self.sensor_env_ranges = {
+            "temp_agua": _ordered(self.spin_env_temp_min.value(), self.spin_env_temp_max.value()),
+            "ph": _ordered(self.spin_env_ph_min.value(), self.spin_env_ph_max.value()),
+            "cond": _ordered(self.spin_env_cond_min.value(), self.spin_env_cond_max.value()),
+            "turb": _ordered(self.spin_env_turb_min.value(), self.spin_env_turb_max.value()),
+            "do": _ordered(self.spin_env_do_min.value(), self.spin_env_do_max.value()),
+        }
+
+        if hasattr(self, "sensor_top_bar"):
+            self.sensor_top_bar.set_ranges(self.sensor_env_ranges)
+
+    def toggle_tablet_mode(self, enabled: bool):
+        """Activa o desactiva modo táctil para mejorar uso sin mouse."""
+        self.tablet_mode_enabled = enabled
+
+        theme = self.combo_theme.currentText() if hasattr(self, "combo_theme") else "Sistema"
+
+        if enabled:
+            if hasattr(self, "combo_density"):
+                self._pre_tablet_density = self.combo_density.currentText() or "Normal"
+            if hasattr(self, "combo_font_size"):
+                try:
+                    self._pre_tablet_font = int(self.combo_font_size.currentText() or "11")
+                except ValueError:
+                    self._pre_tablet_font = 11
+
+            target_font = max(13, self._pre_tablet_font)
+            self.toggle_theme(theme, target_font, "Táctil")
+
+            if hasattr(self, "combo_density"):
+                self.combo_density.blockSignals(True)
+                if self.combo_density.findText("Táctil") != -1:
+                    self.combo_density.setCurrentText("Táctil")
+                self.combo_density.blockSignals(False)
+
+            if hasattr(self, "combo_font_size"):
+                self.combo_font_size.blockSignals(True)
+                self.combo_font_size.setCurrentText(str(target_font))
+                self.combo_font_size.blockSignals(False)
+
+            self.status_bar.set_status("Modo táctil activado", "info")
+        else:
+            self.toggle_theme(theme, self._pre_tablet_font, self._pre_tablet_density)
+
+            if hasattr(self, "combo_density"):
+                self.combo_density.blockSignals(True)
+                self.combo_density.setCurrentText(self._pre_tablet_density)
+                self.combo_density.blockSignals(False)
+
+            if hasattr(self, "combo_font_size"):
+                self.combo_font_size.blockSignals(True)
+                self.combo_font_size.setCurrentText(str(self._pre_tablet_font))
+                self.combo_font_size.blockSignals(False)
+
+            self.status_bar.set_status("Modo táctil desactivado", "info")
+
+        if hasattr(self, "sensor_top_bar"):
+            self.sensor_top_bar.set_tablet_mode(enabled)
             
     def draw_fish_overlay(self, image, data):
         """
@@ -904,8 +1097,8 @@ class MainWindow(QMainWindow):
         
         # VISORES DE VIDEO
         video_layout = QHBoxLayout()
-        self.lbl_left = QLabel() 
-        self.lbl_top = QLabel()
+        self.lbl_left = CameraAspectLabel()
+        self.lbl_top = CameraAspectLabel()
         
         # Cámara Lateral
         left_group = QGroupBox("Vista Lateral (Perfil)")
@@ -936,17 +1129,21 @@ class MainWindow(QMainWindow):
         # FICHA DE RESULTADOS
         results_group = QGroupBox("Diagnóstico Biométrico en Tiempo Real")
         results_group.setStyleSheet("QGroupBox { font-weight: bold; }")
+        results_group.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
+        results_group.setMinimumHeight(320)
         results_layout = QVBoxLayout(results_group)
         
         self.results_text = QTextEdit()
         self.results_text.setReadOnly(True)
-        self.results_text.setMaximumHeight(250)
+        self.results_text.setMinimumHeight(180)
+        self.results_text.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
         self.results_text.setProperty("class", "report-text") 
         self.results_text.setPlaceholderText("Esperando detección para generar reporte...")
         results_layout.addWidget(self.results_text)
         
         self.lbl_stability = QLabel("Esperando espécimen...")
         self.lbl_stability.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.lbl_stability.setMinimumHeight(34)
         self.lbl_stability.setProperty("state", "dim") 
         results_layout.addWidget(self.lbl_stability)
 
@@ -1123,18 +1320,18 @@ class MainWindow(QMainWindow):
         # Vista previa
         preview_group = QGroupBox("Monitor de Captura")
         preview_layout = QHBoxLayout(preview_group)
-        self.lbl_manual_left = QLabel()  
-        self.lbl_manual_top = QLabel()
+        self.lbl_manual_left = CameraAspectLabel()
+        self.lbl_manual_top = CameraAspectLabel()
 
         self.lbl_manual_left.setText("Cámara Lateral")
-        self.lbl_manual_left.setMinimumSize(580, 340)
+        self.lbl_manual_left.setMinimumSize(580, 326)
         self.lbl_manual_left.setProperty("class", "video-lateral")
         self.lbl_manual_left.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.lbl_manual_left.setToolTip("Cámara encargada de medir Longitud y Altura del lomo del pez.")
         preview_layout.addWidget(self.lbl_manual_left)
 
         self.lbl_manual_top.setText("Cámara Cenital")
-        self.lbl_manual_top.setMinimumSize(580, 340)
+        self.lbl_manual_top.setMinimumSize(580, 326)
         self.lbl_manual_top.setProperty("class", "video-cenital")
         self.lbl_manual_top.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.lbl_manual_top.setToolTip("Cámara encargada de medir el Ancho dorsal del pez.")
@@ -1288,6 +1485,7 @@ class MainWindow(QMainWindow):
         self.spin_manual_weight.valueChanged.connect(self.update_k_factor_preview)
         
         layout.addWidget(form_group)
+        layout.addLayout(self._build_quick_notes_row(self.txt_manual_notes))
         layout.addStretch()
         
         self.update_k_factor_preview()
@@ -1295,6 +1493,117 @@ class MainWindow(QMainWindow):
              self.generate_daily_id()
              
         return widget
+
+    def _build_quick_notes_row(self, target_input: QLineEdit):
+        """Crea una fila reutilizable de atajos para notas."""
+        row = QHBoxLayout()
+        row.setSpacing(8)
+
+        lbl = QLabel("Notas rápidas:")
+        row.addWidget(lbl)
+
+        combo = QComboBox()
+        combo.setEditable(True)
+        combo.setInsertPolicy(QComboBox.InsertPolicy.NoInsert)
+        combo.setMinimumWidth(260)
+        combo.setToolTip("Seleccione o escriba una frase frecuente para reutilizar.")
+        self._quick_note_combos.append(combo)
+        self._refresh_quick_note_combo(combo)
+        row.addWidget(combo, 1)
+
+        btn_add = QPushButton("Agregar")
+        btn_add.setProperty("class", "info")
+        btn_add.setToolTip("Añade la frase al final de la nota actual.")
+        btn_add.clicked.connect(lambda: self._apply_quick_note(target_input, combo, mode="append"))
+        row.addWidget(btn_add)
+
+        btn_replace = QPushButton("Reemplazar")
+        btn_replace.setProperty("class", "secondary")
+        btn_replace.setToolTip("Reemplaza el texto actual por la frase seleccionada.")
+        btn_replace.clicked.connect(lambda: self._apply_quick_note(target_input, combo, mode="replace"))
+        row.addWidget(btn_replace)
+
+        btn_save = QPushButton("Guardar frase")
+        btn_save.setProperty("class", "primary")
+        btn_save.setToolTip("Guarda la frase para reutilizarla en futuras mediciones.")
+        btn_save.clicked.connect(lambda: self._save_quick_note_from_combo(combo))
+        row.addWidget(btn_save)
+
+        return row
+
+    def _normalize_note_text(self, text: str) -> str:
+        return " ".join(str(text or "").split()).strip()
+
+    def _apply_quick_note(self, target_input: QLineEdit, combo: QComboBox, mode: str = "append") -> None:
+        note = self._normalize_note_text(combo.currentText())
+        if not note:
+            return
+
+        current = self._normalize_note_text(target_input.text())
+        if mode == "replace" or not current:
+            target_input.setText(note)
+        else:
+            low_current = current.lower()
+            if note.lower() in low_current:
+                target_input.setText(current)
+            else:
+                target_input.setText(f"{current}; {note}")
+
+        self._register_quick_note(note)
+
+    def _save_quick_note_from_combo(self, combo: QComboBox) -> None:
+        note = self._normalize_note_text(combo.currentText())
+        if not note:
+            return
+        self._register_quick_note(note)
+        combo.setCurrentText(note)
+
+    def _register_quick_note(self, note: str) -> None:
+        clean_note = self._normalize_note_text(note)
+        if len(clean_note) < 2:
+            return
+
+        self.quick_notes = [n for n in self.quick_notes if n.lower() != clean_note.lower()]
+        self.quick_notes.insert(0, clean_note)
+        self.quick_notes = self.quick_notes[:25]
+
+        self._refresh_quick_note_combos()
+        self._persist_quick_notes()
+
+    def _refresh_quick_note_combo(self, combo: QComboBox) -> None:
+        try:
+            current_text = combo.currentText()
+            combo.blockSignals(True)
+            combo.clear()
+            combo.addItems(self.quick_notes)
+            combo.setCurrentText(current_text)
+        finally:
+            combo.blockSignals(False)
+
+    def _refresh_quick_note_combos(self) -> None:
+        alive_combos = []
+        for combo in self._quick_note_combos:
+            try:
+                self._refresh_quick_note_combo(combo)
+                alive_combos.append(combo)
+            except RuntimeError:
+                continue
+        self._quick_note_combos = alive_combos
+
+    def _persist_quick_notes(self) -> None:
+        """Persiste atajos de notas sin requerir 'Guardar Configuración'."""
+        try:
+            data = {}
+            if os.path.exists(Config.CONFIG_FILE):
+                with open(Config.CONFIG_FILE, 'r') as f:
+                    data = json.load(f)
+
+            data['quick_notes'] = self.quick_notes
+
+            with open(Config.CONFIG_FILE, 'w') as f:
+                json.dump(data, f, indent=4)
+        except Exception as e:
+            logger.warning(f"No se pudieron persistir notas rápidas: {e}")
 
     def handle_manual_capture_popout(self):
         """Manejador estandarizado de la captura manual"""
@@ -1424,7 +1733,7 @@ class MainWindow(QMainWindow):
             self, 
             "Seleccionar Imagen del Pez",
             "",
-            "Imágenes (*.jpg *.jpeg *.png *.bmp);;Todos los archivos (*.*)"
+            "Imágenes (*.jpg *.jpeg *.png *.bmp *.webp)"
         )
         
         if not filename:
@@ -1473,14 +1782,17 @@ class MainWindow(QMainWindow):
         date_edit = QDateEdit()
         date_edit.setCalendarPopup(True)
         date_edit.setSpecialValueText("Seleccione fecha")
-        date_edit.setDate(QDate(2025, 10, 1))  
-        date_edit.setMinimumDate(QDate(2000, 1, 1))
+        date_edit.setDate(QDate.currentDate())
+        date_edit.setMinimumDate(QDate(2025, 10, 1))
+        date_edit.setMaximumDate(QDate(2026, 6, 1))
         date_edit.setDisplayFormat("yyyy-MM-dd")
         date_edit.setToolTip("Fecha en la que se midió el pez.")
 
         time_edit = QTimeEdit()
         time_edit.setDisplayFormat("HH:mm")
-        time_edit.setTime(QTime(9, 0))  
+        time_edit.setTime(QTime.currentTime())
+        time_edit.setMinimumTime(QTime(7, 0))
+        time_edit.setMaximumTime(QTime(18, 0))
         time_edit.setToolTip("Hora en la que se midió el pez.")
 
         spin_length = self._create_biometric_spinbox('length')
@@ -1516,6 +1828,7 @@ class MainWindow(QMainWindow):
             form_layout.addWidget(widget, i, 1)
         
         layout.addWidget(form_group)
+        layout.addLayout(self._build_quick_notes_row(txt_notes))
         
         lbl_k_factor = self._create_k_factor_label(layout)
         
@@ -1620,6 +1933,8 @@ class MainWindow(QMainWindow):
                 'image_path': filepath,
                 'validation_errors': ''
             }
+
+            self._register_quick_note(txt_notes.text())
             
             self.db.save_measurement(data)
             self.refresh_history()
@@ -1713,10 +2028,22 @@ class MainWindow(QMainWindow):
                 if medidas_movil.get("alto"): spin_height.setValue(float(medidas_movil["alto"]))
             except ValueError:
                 print("Aviso: Algún valor enviado desde el móvil no era un número válido.") 
+
+            if medidas_movil.get("device_timestamp"):
+                try:
+                    parsed_dt = datetime.fromisoformat(
+                        str(medidas_movil["device_timestamp"]).replace("Z", "+00:00")
+                    )
+                    date_edit.setDate(QDate(parsed_dt.year, parsed_dt.month, parsed_dt.day))
+                    time_edit.setTime(QTime(parsed_dt.hour, parsed_dt.minute))
+                except ValueError:
+                    logger.debug("No se pudo parsear device_timestamp de captura móvil")
         
         txt_notes = QLineEdit()
         txt_notes.setPlaceholderText("Observaciones opcionales...")
         txt_notes.setToolTip("Observaciones y notas del pez.")
+        if medidas_movil and medidas_movil.get("notes"):
+            txt_notes.setText(str(medidas_movil.get("notes", "")).strip())
         
         fields = [
             ("ID Pez:", txt_id),
@@ -1734,6 +2061,7 @@ class MainWindow(QMainWindow):
             form_grid.addWidget(widget, i, 1)
         
         layout.addWidget(form_group)
+        layout.addLayout(self._build_quick_notes_row(txt_notes))
         
         lbl_k = self._create_k_factor_label(layout)
         
@@ -1809,6 +2137,8 @@ class MainWindow(QMainWindow):
                     'notes': f"[IMAGEN EXTERNA QR] {txt_notes.text()}",
                     'validation_errors': ''
                 }
+
+                self._register_quick_note(txt_notes.text())
                 
                 db = getattr(self, 'db_manager', getattr(self, 'db', None))
                 if db:
@@ -1838,7 +2168,7 @@ class MainWindow(QMainWindow):
         """
         pc_ip = get_local_ip() 
         port = 5000
-        url = f"http://{pc_ip}:{port}/"
+        url = build_mobile_access_url(pc_ip, port)
         qr_path = os.path.join(Config.IMAGES_MANUAL_DIR, "temp_qr.png")
 
         try:
@@ -1875,7 +2205,8 @@ class MainWindow(QMainWindow):
         lbl_instructions = QLabel(
             "1. Escanea el código QR con tu celular\n"
             "2. Captura las fotos (lateral + cenital)\n"
-            "3. Envía las imágenes al sistema"
+            "3. Envía las imágenes al sistema\n"
+            "4. El acceso ya viaja embebido en el QR"
         )
         lbl_instructions.setAlignment(Qt.AlignmentFlag.AlignCenter)
         lbl_instructions.setProperty("class", "report-text") 
@@ -1945,14 +2276,15 @@ class MainWindow(QMainWindow):
                     paquete = mobile_capture_queue.get(block=False)
                     image_path = paquete.get("path")
                     medidas_recibidas = paquete.get("medidas")
+                    request_id = paquete.get("request_id", "sin-id")
                     
-                    Config.logger.info(f"Captura móvil recibida: {image_path}")
+                    Config.logger.info(f"Captura móvil recibida: {image_path} | request_id={request_id}")
                     
                     # Detener timer
                     timer.stop()
                     
                     # Actualizar estado
-                    lbl_status.setText("✅ ¡Imagen y datos recibidos!")
+                    lbl_status.setText(f"✅ ¡Imagen y datos recibidos! ID: {request_id}")
                     lbl_status.setStyleSheet("""
                         padding: 10px;
                         color: #2a9d8f;
@@ -2495,6 +2827,8 @@ class MainWindow(QMainWindow):
         if not re.match(r'^[a-zA-Z0-9_-]+$', fish_id):
             QMessageBox.warning(self, "⚠️ ID Inválido", "Solo letras, números, guiones y guiones bajos.")
             return
+
+        self._register_quick_note(notes)
         
         if not hasattr(self, 'manual_frame_left') or self.manual_frame_left is None:
             QMessageBox.warning(self, "⚠️ Sin Imagen", "Falta la captura lateral.")
@@ -2865,6 +3199,17 @@ class MainWindow(QMainWindow):
                                 "y su imagen asociada.")
         btn_delete.clicked.connect(self.delete_selected_measurement)
         top_controls.addWidget(btn_delete)
+
+        self.btn_toggle_history_preview = QPushButton("Ocultar vista previa")
+        self.btn_toggle_history_preview.setProperty("class", "secondary")
+        self.btn_toggle_history_preview.style().unpolish(self.btn_toggle_history_preview)
+        self.btn_toggle_history_preview.style().polish(self.btn_toggle_history_preview)
+        self.btn_toggle_history_preview.setCursor(Qt.PointingHandCursor)
+        self.btn_toggle_history_preview.setCheckable(True)
+        self.btn_toggle_history_preview.setChecked(True)
+        self.btn_toggle_history_preview.setToolTip("Mostrar u ocultar el panel de vista previa.")
+        self.btn_toggle_history_preview.toggled.connect(self.toggle_history_preview)
+        top_controls.addWidget(self.btn_toggle_history_preview)
         
         layout.addLayout(top_controls)
 
@@ -2993,6 +3338,7 @@ class MainWindow(QMainWindow):
         )
 
         self.table_history.cellDoubleClicked.connect(self.view_measurement_image)
+        self.table_history.itemSelectionChanged.connect(self.update_history_preview)
         self.table_history.setContextMenuPolicy(Qt.CustomContextMenu)
         self.table_history.customContextMenuRequested.connect(self.edit_from_right_click)
 
@@ -3002,6 +3348,39 @@ class MainWindow(QMainWindow):
         header.customContextMenuRequested.connect(self.show_column_menu)
 
         layout.addWidget(self.table_history)
+
+        quick_totals_layout = QHBoxLayout()
+        self.lbl_quick_total = QLabel("Total: 0")
+        self.lbl_quick_manual = QLabel("Manuales: 0")
+        self.lbl_quick_auto = QLabel("Automáticas: 0")
+        self.lbl_quick_avg_length = QLabel("Largo Prom: 0.00 cm")
+        self.lbl_quick_avg_weight = QLabel("Peso Prom: 0.00 g")
+
+        for lbl in [
+            self.lbl_quick_total,
+            self.lbl_quick_manual,
+            self.lbl_quick_auto,
+            self.lbl_quick_avg_length,
+            self.lbl_quick_avg_weight,
+        ]:
+            lbl.setProperty("class", "report-text")
+            quick_totals_layout.addWidget(lbl)
+            quick_totals_layout.addSpacing(10)
+        quick_totals_layout.addStretch()
+        layout.addLayout(quick_totals_layout)
+
+        self.history_preview_group = QGroupBox("Vista previa")
+        preview_group_layout = QVBoxLayout(self.history_preview_group)
+        preview_group_layout.setContentsMargins(4, 4, 4, 4)
+        preview_group_layout.setSpacing(0)
+
+        self.lbl_history_preview = QLabel("Sin selección")
+        self.lbl_history_preview.setAlignment(Qt.AlignCenter)
+        self.lbl_history_preview.setFixedHeight(160)
+        self.lbl_history_preview.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+        self.lbl_history_preview.setStyleSheet("border: 1px solid #6c757d;")
+        preview_group_layout.addWidget(self.lbl_history_preview)
+        layout.addWidget(self.history_preview_group)
 
         pagination_layout = QHBoxLayout()
         self.lbl_total_records = QLabel("Total: 0 registros")
@@ -3056,92 +3435,17 @@ class MainWindow(QMainWindow):
         
         # Inicializar
         self.current_page = 1
+        self.current_page_offset = 0
+        self.history_total_records = 0
         self.load_measurements()
-        self.refresh_history()
         
         return widget
     
     def load_measurements(self):
         """
-        Carga los datos en la tabla. Versión FINAL y limpia.
+        Wrapper legado: usa el flujo unificado de refresh.
         """
-        self.table_history.setRowCount(0)
-        
-        # 1. Obtener límite
-        try:
-            limit_val = int(self.combo_limit.currentText())
-        except:
-            limit_val = 50
-
-        # 2. Consultar base de datos
-        try:
-            results = self.db.get_filtered_measurements(
-                limit=limit_val,
-                search_query=self.txt_search.text(),
-                filter_type=self.combo_filter_type.currentText() if self.combo_filter_type.currentText() != "Todos" else None
-            )
-        except Exception as e:
-            logger.error(f"Error fatal consultando DB: {e}")
-            return
-
-        # 3. Iterar filas
-        for row_data in results:
-            row_idx = self.table_history.rowCount()
-            self.table_history.insertRow(row_idx)
-
-            # --- COLUMNAS FIJAS ---
-            id_val = self.db.get_field_value(row_data, "id")
-            ts_val = self.db.get_field_value(row_data, "timestamp", "")
-            type_val = self.db.get_field_value(row_data, "measurement_type", "manual")
-            fish_val = self.db.get_field_value(row_data, "fish_id", "")
-            
-            l_val = f"{self.db.get_field_value(row_data, 'length_cm', 0):.2f}"
-            h_val = f"{self.db.get_field_value(row_data, 'height_cm', 0):.2f}"
-            w_val = f"{self.db.get_field_value(row_data, 'width_cm', 0):.2f}"
-            gr_val = f"{self.db.get_field_value(row_data, 'weight_g', 0):.2f}"
-            
-            k_val = "" 
-            conf_val = f"{self.db.get_field_value(row_data, 'confidence_score', 0):.2f}"
-            note_val = self.db.get_field_value(row_data, "notes", "")
-
-            fixed_values = [id_val, ts_val, type_val, fish_val, l_val, h_val, w_val, gr_val, k_val, conf_val, note_val]
-
-            for col, val in enumerate(fixed_values):
-                item = QTableWidgetItem(str(val))
-                if col >= 4 and col <= 9: # Columnas numéricas
-                    item.setTextAlignment(Qt.AlignRight | Qt.AlignVCenter)
-                else: 
-                    item.setTextAlignment(Qt.AlignLeft | Qt.AlignVCenter)
-                self.table_history.setItem(row_idx, col, item)
-
-            # --- COLUMNAS DE LA API ---
-            api_keys = [
-                "api_air_temp_c", "api_water_temp_c", "api_rel_humidity",
-                "api_abs_humidity_g_m3", "api_ph", "api_cond_us_cm", 
-                "api_do_mg_l", "api_turbidity_ntu"
-            ]
-            
-            start_col = len(self.fixed_columns) 
-
-            for i, key in enumerate(api_keys):
-                raw_val = self.db.get_field_value(row_data, key)
-                
-                # Visualización limpia
-                if raw_val is None or raw_val == "":
-                    display_text = "-"
-                else:
-                    try:
-                        val_float = float(raw_val)
-                        display_text = f"{val_float:.2f}"
-                    except:
-                        display_text = str(raw_val)
-
-                item = QTableWidgetItem(display_text)
-                item.setTextAlignment(Qt.AlignRight | Qt.AlignVCenter)
-                self.table_history.setItem(row_idx, start_col + i, item)
-
-        if hasattr(self, 'lbl_total_records'):
-            self.lbl_total_records.setText(f"Registros cargados: {len(results)}")
+        self.refresh_history()
 
     def show_column_menu(self, position):
         """Menú contextual para mostrar/ocultar columnas (Click derecho en cabecera)"""
@@ -3194,11 +3498,15 @@ class MainWindow(QMainWindow):
         self.current_page_offset = 0
         self.refresh_history()
         self.refresh_daily_counter()
-        self.sender().clearFocus()
+        sender = self.sender()
+        if sender is not None and hasattr(sender, 'clearFocus'):
+            sender.clearFocus()
 
     def next_page(self):
         """Avanza de página basado en el límite seleccionado"""
         limit = int(self.combo_limit.currentText())
+        if self.current_page_offset + limit >= self.history_total_records:
+            return
         self.current_page_offset += limit
         self.refresh_history()
 
@@ -3232,11 +3540,30 @@ class MainWindow(QMainWindow):
         
         date_start = self.date_from.date().toString("yyyy-MM-dd")
         date_end = self.date_to.date().toString("yyyy-MM-dd")
+
+        if self.date_from.date() > self.date_to.date():
+            self.status_bar.set_status("Rango de fechas inválido: 'Desde' no puede ser mayor que 'Hasta'", "warning")
+            self.table_history.setRowCount(0)
+            self.lbl_total_records.setText("No se encontraron registros.")
+            self.lbl_page_info.setText("0")
+            self.history_total_records = 0
+            self.btn_prev_page.setEnabled(False)
+            self.btn_next_page.setEnabled(False)
+            self.update_history_quick_totals(None)
+            self.clear_history_preview()
+            return
         
         try:
             limit = int(self.combo_limit.currentText())
         except:
             limit = 25
+
+        self.history_total_records = self.db.get_filtered_measurements_count(
+            search_query=search_text,
+            filter_type=filter_type,
+            date_start=date_start,
+            date_end=date_end
+        )
 
         measurements = self.db.get_filtered_measurements(
             limit=limit, 
@@ -3246,12 +3573,34 @@ class MainWindow(QMainWindow):
             date_start=date_start,
             date_end=date_end
         )
+
+        if self.current_page_offset >= self.history_total_records and self.history_total_records > 0:
+            last_page_offset = ((self.history_total_records - 1) // limit) * limit
+            self.current_page_offset = max(0, last_page_offset)
+            measurements = self.db.get_filtered_measurements(
+                limit=limit,
+                offset=self.current_page_offset,
+                search_query=search_text,
+                filter_type=filter_type,
+                date_start=date_start,
+                date_end=date_end
+            )
         
         self.table_history.setRowCount(0)
         
         if not measurements:
             self.lbl_total_records.setText("No se encontraron registros.")
             self.lbl_page_info.setText("0")
+            self.btn_prev_page.setEnabled(False)
+            self.btn_next_page.setEnabled(False)
+            self.update_history_quick_totals({
+                "total": self.history_total_records,
+                "avg_length": 0.0,
+                "avg_weight": 0.0,
+                "manual_total": 0,
+                "auto_total": 0,
+            })
+            self.clear_history_preview()
             return
 
         self.table_history.setRowCount(len(measurements))
@@ -3395,14 +3744,194 @@ class MainWindow(QMainWindow):
         self.lbl_page_info.setText(str(current_page))
         
         count_shown = len(measurements)
-        self.lbl_total_records.setText(f"Mostrando {count_shown} registros")
+        self.lbl_total_records.setText(f"Mostrando {count_shown} de {self.history_total_records} registros")
         
         self.btn_prev_page.setEnabled(self.current_page_offset > 0)
-        self.btn_next_page.setEnabled(count_shown == limit)
+        self.btn_next_page.setEnabled(self.current_page_offset + count_shown < self.history_total_records)
+
+        quick_totals = self.db.get_filtered_measurements_quick_totals(
+            search_query=search_text,
+            filter_type=filter_type,
+            date_start=date_start,
+            date_end=date_end
+        )
+        self.update_history_quick_totals(quick_totals)
+        self.update_history_preview()
         
         if hasattr(self, 'refresh_daily_counter'):
             self.refresh_daily_counter()
-  
+
+    def update_history_quick_totals(self, totals):
+        """Actualiza los indicadores de resumen rápido del historial."""
+        if totals is None:
+            totals = {
+                "total": 0,
+                "manual_total": 0,
+                "auto_total": 0,
+                "avg_length": 0.0,
+                "avg_weight": 0.0,
+            }
+
+        total = int(totals.get("total", 0) or 0)
+        manual_total = int(totals.get("manual_total", 0) or 0)
+        auto_total = int(totals.get("auto_total", 0) or 0)
+        avg_length = float(totals.get("avg_length", 0.0) or 0.0)
+        avg_weight = float(totals.get("avg_weight", 0.0) or 0.0)
+
+        self.lbl_quick_total.setText(f"Total: {total}")
+        self.lbl_quick_manual.setText(f"Manuales: {manual_total}")
+        self.lbl_quick_auto.setText(f"Automáticas: {auto_total}")
+        self.lbl_quick_avg_length.setText(f"Largo Prom: {avg_length:.2f} cm")
+        self.lbl_quick_avg_weight.setText(f"Peso Prom: {avg_weight:.2f} g")
+
+    def toggle_history_preview(self, checked):
+        """Permite mostrar u ocultar la vista previa del historial."""
+        if hasattr(self, 'history_preview_group'):
+            self.history_preview_group.setVisible(checked)
+
+        if hasattr(self, 'btn_toggle_history_preview'):
+            self.btn_toggle_history_preview.setText(
+                "Ocultar vista previa" if checked else "Mostrar vista previa"
+            )
+
+        if checked:
+            self.update_history_preview()
+
+    def _resolve_measurement_image_path(self, measurement_data):
+        """Resuelve la ruta real de la imagen usando ruta directa, nombre y timestamp."""
+        if not measurement_data:
+            return None
+
+        image_path = str(measurement_data.get('image_path', '') or '').strip()
+        fish_id = str(measurement_data.get('fish_id', '') or '').strip()
+        ts_str = str(measurement_data.get('timestamp', '') or '').strip()
+
+        if image_path:
+            abs_path = os.path.abspath(image_path)
+            if os.path.exists(abs_path):
+                return abs_path
+            if os.path.exists(image_path):
+                return image_path
+
+        search_dirs = [
+            os.path.abspath(Config.IMAGES_MANUAL_DIR),
+            os.path.abspath(Config.IMAGES_AUTO_DIR),
+            os.path.abspath(os.path.join("Resultados", "Imagenes_Manuales")),
+            os.path.abspath(os.path.join("Resultados", "Imagenes_Automaticas")),
+        ]
+
+        unique_dirs = []
+        for path in search_dirs:
+            if path not in unique_dirs and os.path.isdir(path):
+                unique_dirs.append(path)
+
+        filename = os.path.basename(image_path) if image_path else ""
+        if filename:
+            for base in unique_dirs:
+                candidate = os.path.join(base, filename)
+                if os.path.exists(candidate):
+                    return candidate
+
+        timestamp_key = ""
+        if ts_str:
+            timestamp_key = ts_str.replace("-", "").replace(":", "").replace(" ", "_")[:15]
+
+        if len(timestamp_key) > 10:
+            valid_ext = ('.jpg', '.jpeg', '.png', '.bmp', '.webp')
+            matches = []
+            for base in unique_dirs:
+                try:
+                    for name in os.listdir(base):
+                        lower_name = name.lower()
+                        if timestamp_key in name and lower_name.endswith(valid_ext):
+                            matches.append(os.path.join(base, name))
+                except Exception:
+                    continue
+
+            if matches:
+                if fish_id:
+                    for candidate in matches:
+                        if fish_id in os.path.basename(candidate):
+                            return candidate
+                return matches[0]
+
+        return None
+
+    def clear_history_preview(self):
+        """Limpia el panel de vista previa del historial."""
+        self.current_preview_image_path = None
+        if hasattr(self, 'lbl_history_preview'):
+            self.lbl_history_preview.setPixmap(QPixmap())
+            self.lbl_history_preview.setText("Sin selección")
+
+    def _copy_preview_path(self):
+        """Copia la ruta de la imagen actual al portapapeles."""
+        path = getattr(self, 'current_preview_image_path', None)
+        if path and os.path.exists(path):
+            QApplication.clipboard().setText(os.path.abspath(path))
+
+    def _render_history_preview_pixmap(self, pixmap):
+        """Renderiza miniatura respetando relación de aspecto (imagen completa visible)."""
+        if not hasattr(self, 'lbl_history_preview') or pixmap is None or pixmap.isNull():
+            return False
+
+        target_size = self.lbl_history_preview.size()
+        if target_size.width() <= 1 or target_size.height() <= 1:
+            return False
+
+        scaled = pixmap.scaled(
+            target_size,
+            Qt.KeepAspectRatio,
+            Qt.SmoothTransformation,
+        )
+
+        self.lbl_history_preview.setPixmap(scaled)
+        self.lbl_history_preview.setText("")
+        return True
+
+    def update_history_preview(self):
+        """Actualiza la miniatura de la fila seleccionada en historial."""
+        if not hasattr(self, 'table_history'):
+            return
+
+        if hasattr(self, 'history_preview_group') and not self.history_preview_group.isVisible():
+            return
+
+        row = self.table_history.currentRow()
+        if row < 0:
+            self.clear_history_preview()
+            return
+
+        id_item = self.table_history.item(row, 0)
+        if id_item is None:
+            self.clear_history_preview()
+            return
+
+        try:
+            measurement_id = int(id_item.text())
+        except (TypeError, ValueError):
+            self.clear_history_preview()
+            return
+
+        data = self.db.get_measurement_as_dict(measurement_id)
+        if not data:
+            self.clear_history_preview()
+            return
+
+        image_path = self._resolve_measurement_image_path(data)
+        self.current_preview_image_path = image_path
+
+        has_image = bool(image_path and os.path.exists(image_path))
+
+        if has_image:
+            pixmap = QPixmap(image_path)
+            if not self._render_history_preview_pixmap(pixmap):
+                self.lbl_history_preview.setPixmap(QPixmap())
+                self.lbl_history_preview.setText("Sin vista previa")
+        else:
+            self.lbl_history_preview.setPixmap(QPixmap())
+            self.lbl_history_preview.setText("Sin imagen")
+
     def create_statistics_tab(self):
         """Crea la pestaña de estadísticas """
         widget = QWidget()
@@ -3421,11 +3950,24 @@ class MainWindow(QMainWindow):
         )
         btn_generate_stats.clicked.connect(self.generate_statistics)
         controls.addWidget(btn_generate_stats)
+
+        self.btn_toggle_stats_report = QPushButton("Ocultar reporte")
+        self.btn_toggle_stats_report.setProperty("class", "secondary")
+        self.btn_toggle_stats_report.style().unpolish(self.btn_toggle_stats_report)
+        self.btn_toggle_stats_report.style().polish(self.btn_toggle_stats_report)
+        self.btn_toggle_stats_report.setCursor(Qt.PointingHandCursor)
+        self.btn_toggle_stats_report.setCheckable(True)
+        self.btn_toggle_stats_report.setChecked(True)
+        self.btn_toggle_stats_report.setToolTip("Mostrar u ocultar el panel de reporte detallado.")
+        self.btn_toggle_stats_report.toggled.connect(self.toggle_statistics_report)
+        controls.addWidget(self.btn_toggle_stats_report)
         
         controls.addStretch()
         layout.addLayout(controls)
 
         self.splitter = QSplitter(Qt.Orientation.Horizontal)
+        self._stats_splitter_handle_width = self.splitter.handleWidth()
+        self.splitter.setChildrenCollapsible(True)
         
         left_container = QWidget()
         left_layout = QVBoxLayout(left_container)
@@ -3438,13 +3980,15 @@ class MainWindow(QMainWindow):
         self.gallery_list = QListWidget()
         self.gallery_list.setProperty("class", "gallery-list")
         self.gallery_list.setViewMode(QListWidget.ViewMode.IconMode)
-        self.gallery_list.setIconSize(QSize(220, 160))
+        self.gallery_list.setIconSize(QSize(230, 165))
+        self.gallery_list.setGridSize(QSize(255, 210))
+        self.gallery_list.setWordWrap(True)
         self.gallery_list.setSpacing(10) 
         self.gallery_list.itemDoubleClicked.connect(self.open_enlarged_graph)
         left_layout.addWidget(self.gallery_list)
         
-        right_container = QWidget()
-        right_layout = QVBoxLayout(right_container)
+        self.stats_report_panel = QWidget()
+        right_layout = QVBoxLayout(self.stats_report_panel)
         right_layout.setContentsMargins(0,0,0,0)
         
         lbl_report = QLabel("Reporte Detallado")
@@ -3454,12 +3998,13 @@ class MainWindow(QMainWindow):
         self.stats_text = QTextEdit()
         self.stats_text.setProperty("class", "report-text")
         self.stats_text.setReadOnly(True)
+        self.stats_text.setPlaceholderText("Genere estadísticas para ver el resumen analítico.")
         right_layout.addWidget(self.stats_text)
 
         self.splitter.addWidget(left_container)
-        self.splitter.addWidget(right_container)
-        self.splitter.setStretchFactor(0, 6) 
-        self.splitter.setStretchFactor(1, 4) 
+        self.splitter.addWidget(self.stats_report_panel)
+        self.splitter.setStretchFactor(0, 7) 
+        self.splitter.setStretchFactor(1, 3) 
         layout.addWidget(self.splitter)
         
         bottom_widget = QWidget()
@@ -3473,23 +4018,43 @@ class MainWindow(QMainWindow):
         buttons_config = [
             # Fila 0: Distribuciones Básicas
             ("📏 Histograma Tallas", 'length', 
-             "<b>DISTRIBUCIÓN TALLAS:</b><br>Frecuencia de longitudes.", 0, 0),
+               "<b>DISTRIBUCIÓN TALLAS:</b><br>Frecuencia de longitudes del lote para evaluar uniformidad.", 0, 0),
              
             ("⚖️ Histograma Pesos", 'weight', 
-             "<b>DISTRIBUCIÓN PESO:</b><br>Frecuencia de biomasa.", 0, 1),
+               "<b>DISTRIBUCIÓN PESO:</b><br>Frecuencia de biomasa y dispersión de pesos.", 0, 1),
              
             ("📈 Salud (L vs P)", 'correlation', 
-             "<b>RELACIÓN L/P:</b><br>Dispersión Longitud vs Peso.", 0, 2),
+               "<b>RELACIÓN L/P:</b><br>Relación longitud-peso por pez para detectar consistencia biológica.", 0, 2),
              
             # Fila 1: Crecimiento y Morfometría
             ("⏱ Crecimiento (Peso)", 'timeline_weight', 
-             "<b>EVOLUCIÓN PESO:</b><br>Curva de crecimiento con proyección.", 1, 0),
+               "<b>EVOLUCIÓN PESO:</b><br>Promedio semanal y tendencia proyectada (Gompertz/lineal).", 1, 0),
              
             ("📏 Crecimiento (Largo)", 'timeline_length', 
-             "<b>EVOLUCIÓN LONGITUD:</b><br>Curva de crecimiento con proyección.", 1, 1),
+               "<b>EVOLUCIÓN LONGITUD:</b><br>Evolución semanal de talla con proyección futura.", 1, 1),
              
             ("🧬 Morfometría (H/W)", 'morphometry', 
-             "<b>ANCHO Y ALTO:</b><br>Distribución combinada de medidas.", 1, 2),
+               "<b>ANCHO Y ALTO:</b><br>Distribución comparada de altura y ancho corporal.", 1, 2),
+
+              # Fila 2: Condición corporal y variabilidad
+              ("🧪 Factor K", 'k_factor',
+               "<b>FACTOR K:</b><br>Estado corporal del lote; compara contra zona óptima.", 2, 0),
+
+              ("📐 Perfil Corporal", 'body_profile',
+               "<b>PERFIL CORPORAL:</b><br>Dispersión ancho vs altura para forma del pez.", 2, 1),
+
+              ("📦 Variabilidad (CV%)", 'variability',
+               "<b>VARIABILIDAD:</b><br>Coeficiente de variación por métrica biométrica.", 2, 2),
+
+              # Fila 3: Operación y control de muestreo
+              ("📅 Muestreo Semanal", 'sampling_weekly',
+               "<b>INTENSIDAD DE MUESTREO:</b><br>Cantidad de mediciones por semana.", 3, 0),
+
+              ("📊 Clases de Talla", 'size_classes',
+               "<b>CLASES DE TALLA:</b><br>Distribución por intervalos de longitud para clasificación del lote.", 3, 1),
+
+              ("🫀 Tendencia Factor K", 'condition_trend',
+               "<b>TENDENCIA K:</b><br>Evolución semanal del estado de condición corporal.", 3, 2),
         ]
 
         for text, key, tip, r, c in buttons_config:
@@ -3562,6 +4127,24 @@ class MainWindow(QMainWindow):
         layout.addWidget(bottom_widget)
         
         return widget
+
+    def toggle_statistics_report(self, checked):
+        """Permite mostrar u ocultar el panel de reporte detallado."""
+        if hasattr(self, 'stats_report_panel'):
+            self.stats_report_panel.setVisible(checked)
+            self.stats_report_panel.setMaximumWidth(16777215 if checked else 0)
+
+        if hasattr(self, 'btn_toggle_stats_report'):
+            self.btn_toggle_stats_report.setText(
+                "Ocultar reporte" if checked else "Mostrar reporte"
+            )
+
+        if checked and hasattr(self, 'splitter'):
+            self.splitter.setHandleWidth(getattr(self, '_stats_splitter_handle_width', 6))
+            self.splitter.setSizes([700, 300])
+        elif hasattr(self, 'splitter'):
+            self.splitter.setHandleWidth(0)
+            self.splitter.setSizes([1, 0])
     
     def open_output_folder(self):
         """Abre la carpeta de resultados en el explorador del sistema"""
@@ -3617,6 +4200,24 @@ class MainWindow(QMainWindow):
         
         self.gallery_list.addItem(item)
 
+    def _build_stats_graph_tooltip(self, graph_key):
+        """Devuelve una descripción corta y útil para cada gráfica estadística."""
+        tooltip_map = {
+            'length': "Frecuencia de tallas del lote. Permite revisar dispersión y uniformidad de longitud.",
+            'weight': "Frecuencia de pesos del lote para monitorear biomasa y heterogeneidad.",
+            'correlation': "Relación longitud-peso por individuo. Ayuda a detectar crecimiento fuera de patrón.",
+            'timeline_weight': "Evolución semanal del peso promedio con tendencia proyectada.",
+            'timeline_length': "Evolución semanal de la longitud promedio con tendencia proyectada.",
+            'morphometry': "Comparación de distribuciones de altura y ancho corporal.",
+            'k_factor': "Distribución del factor de condición K del lote; referencia de estado corporal.",
+            'body_profile': "Dispersión ancho vs altura para evaluar perfil corporal y consistencia morfológica.",
+            'variability': "Coeficiente de variación (CV%) por indicador: longitud, peso, altura y ancho.",
+            'sampling_weekly': "Número de mediciones por semana para control de cobertura de muestreo.",
+            'size_classes': "Conteo de peces por clase de talla para segmentación operativa.",
+            'condition_trend': "Promedio semanal del factor K para seguimiento de condición del lote.",
+        }
+        return tooltip_map.get(graph_key, "Gráfica estadística del lote.")
+
     def export_individual_graph(self, graph_type):
         """
         💾 EXPORTADOR PROFESIONAL (CORREGIDO):
@@ -3636,6 +4237,8 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(self, "Advertencia", "No hay datos en la base de datos.")
             return
 
+        stats_data = self._build_statistics_dataset(measurements)
+
         # 2. Configurar Estilo de Reporte (Fondo Blanco)
         plt.style.use('default') 
         plt.rcParams.update({'font.size': 10, 'font.family': 'sans-serif'})
@@ -3650,29 +4253,6 @@ class MainWindow(QMainWindow):
         # Preparar Figura
         fig, ax = plt.subplots(figsize=(10, 6), dpi=300)
         
-        # --- CORRECCIÓN CRÍTICA: MAPEO SEGURO ---
-        # Creamos el mapa de columnas localmente para no fallar
-        col_map = {col: i for i, col in enumerate(MEASUREMENT_COLUMNS)}
-
-        def get_val(m, field):
-            idx = col_map.get(field)
-            if idx is not None and idx < len(m):
-                val = m[idx]
-                if val is not None and val != "":
-                    try: return float(val)
-                    except: return 0.0
-            return 0.0
-
-        def get_date(m):
-            idx = col_map.get('timestamp')
-            if idx is not None and idx < len(m):
-                val = m[idx]
-                try: return datetime.fromisoformat(str(val))
-                except: return None
-            return None
-        # ----------------------------------------
-
-        filename = f"grafico_{graph_type}.png"
         has_data = False
 
         # ======================================================================
@@ -3681,7 +4261,7 @@ class MainWindow(QMainWindow):
 
         # A. HISTOGRAMAS
         if graph_type == 'length':
-            data = [get_val(m, 'length_cm') for m in measurements if get_val(m, 'length_cm') > 0]
+            data = stats_data['lengths']
             if data:
                 ax.hist(data, bins=15, color=C_BLUE, alpha=0.7, edgecolor='black')
                 ax.set_title('Distribución de Tallas (Longitud)', fontweight='bold')
@@ -3690,7 +4270,7 @@ class MainWindow(QMainWindow):
                 has_data = True
 
         elif graph_type == 'weight':
-            data = [get_val(m, 'weight_g') for m in measurements if get_val(m, 'weight_g') > 0]
+            data = stats_data['weights']
             if data:
                 ax.hist(data, bins=15, color=C_GREEN, alpha=0.7, edgecolor='black')
                 ax.set_title('Distribución de Biomasa (Peso)', fontweight='bold')
@@ -3699,8 +4279,8 @@ class MainWindow(QMainWindow):
                 has_data = True
 
         elif graph_type == 'morphometry':
-            h_data = [get_val(m, 'height_cm') for m in measurements if get_val(m, 'height_cm') > 0]
-            w_data = [get_val(m, 'width_cm') for m in measurements if get_val(m, 'width_cm') > 0]
+            h_data = stats_data['heights']
+            w_data = stats_data['widths']
             
             if h_data:
                 ax.hist(h_data, bins=10, color=C_BLUE, alpha=0.5, label='Altura', edgecolor='black')
@@ -3711,14 +4291,12 @@ class MainWindow(QMainWindow):
             
             ax.set_title('Morfometría (Altura y Ancho)', fontweight='bold')
             ax.set_xlabel('Medida (cm)')
+            ax.set_ylabel('Frecuencia')
 
         # B. SCATTER (Correlación)
         elif graph_type == 'correlation':
-            l_list, w_list = [], []
-            for m in measurements:
-                l, w = get_val(m, 'length_cm'), get_val(m, 'weight_g')
-                if l > 0 and w > 0:
-                    l_list.append(l); w_list.append(w)
+            l_list = [pair[0] for pair in stats_data['pairs']]
+            w_list = [pair[1] for pair in stats_data['pairs']]
             
             if l_list:
                 # CORRECCIÓN: Agregamos label='Muestras' para que ax.legend() funcione
@@ -3728,23 +4306,117 @@ class MainWindow(QMainWindow):
                 ax.set_xlabel('Longitud (cm)'); ax.set_ylabel('Peso (g)')
                 has_data = True
 
+        elif graph_type == 'k_factor':
+            k_values = stats_data['k_factors']
+            if k_values:
+                ax.hist(k_values, bins=12, color='#16a085', alpha=0.75, edgecolor='black', label='Muestras')
+                ax.axvspan(1.0, 1.4, color='#2ecc71', alpha=0.15, label='Zona óptima')
+                ax.axvline(np.mean(k_values), color='#0b5345', linestyle='--', linewidth=1.8, label=f"Promedio: {np.mean(k_values):.3f}")
+                ax.set_title('Distribución Factor K', fontweight='bold')
+                ax.set_xlabel('Factor de condición K'); ax.set_ylabel('Frecuencia')
+                has_data = True
+
+        elif graph_type == 'body_profile':
+            body_records = [record for record in stats_data['records'] if record.get('height', 0) > 0 and record.get('width', 0) > 0]
+            if body_records:
+                widths = [record['width'] for record in body_records]
+                heights = [record['height'] for record in body_records]
+                ax.scatter(widths, heights, c='#af7ac5', alpha=0.65, edgecolors='black', linewidths=0.4, label='Muestras')
+
+                if len(widths) >= 2:
+                    coeffs = np.polyfit(widths, heights, 1)
+                    trend_x = np.linspace(min(widths), max(widths), 60)
+                    trend_y = np.poly1d(coeffs)(trend_x)
+                    ax.plot(trend_x, trend_y, '--', color='#5b2c6f', linewidth=1.6, label='Tendencia')
+
+                ax.set_title('Perfil Corporal (Ancho vs Altura)', fontweight='bold')
+                ax.set_xlabel('Ancho dorsal (cm)'); ax.set_ylabel('Altura corporal (cm)')
+                has_data = True
+
+        elif graph_type == 'variability':
+            metric_map = {
+                'Longitud': stats_data['lengths'],
+                'Peso': stats_data['weights'],
+                'Altura': stats_data['heights'],
+                'Ancho': stats_data['widths'],
+            }
+            labels = []
+            cv_values = []
+            for label, values in metric_map.items():
+                if len(values) >= 2 and np.mean(values) > 0:
+                    labels.append(label)
+                    cv_values.append((np.std(values) / np.mean(values)) * 100)
+
+            if labels:
+                bars = ax.bar(labels, cv_values, color=['#3498db', '#2ecc71', '#1abc9c', '#f1c40f'][:len(labels)], edgecolor='black', alpha=0.85)
+                for bar, value in zip(bars, cv_values):
+                    ax.text(bar.get_x() + bar.get_width() / 2, value + 0.35, f"{value:.1f}%", ha='center', va='bottom', fontsize=9, fontweight='bold')
+                ax.set_title('Variabilidad Biométrica (CV%)', fontweight='bold')
+                ax.set_xlabel('Indicador'); ax.set_ylabel('Coeficiente de variación (%)')
+                has_data = True
+
+        elif graph_type == 'sampling_weekly':
+            weekly_counts = self._build_weekly_metric_map(stats_data['records'], 'length')
+            if weekly_counts:
+                weeks = sorted(weekly_counts.keys())
+                labels = [datetime.combine(week, datetime.min.time()) for week in weeks]
+                counts = [len(weekly_counts[week]) for week in weeks]
+                ax.bar(labels, counts, color='#5dade2', edgecolor='#1b4f72', width=5, label='Mediciones')
+                ax.set_title('Intensidad de Muestreo Semanal', fontweight='bold')
+                ax.set_xlabel('Semana'); ax.set_ylabel('Número de mediciones')
+                ax.xaxis.set_major_formatter(mdates.DateFormatter('%d/%b'))
+                fig.autofmt_xdate(rotation=45, ha='right')
+                has_data = True
+
+        elif graph_type == 'size_classes':
+            lengths = stats_data['lengths']
+            if lengths:
+                class_bins = min(7, max(4, int(np.sqrt(len(lengths)))))
+                counts, bins = np.histogram(lengths, bins=class_bins)
+                labels = [f"{bins[i]:.1f}-{bins[i + 1]:.1f}" for i in range(len(counts))]
+                ax.bar(labels, counts, color='#2471a3', alpha=0.85, edgecolor='black', label='Peces')
+                ax.set_title('Clases de Talla del Lote', fontweight='bold')
+                ax.set_xlabel('Rango de longitud (cm)'); ax.set_ylabel('Cantidad')
+                ax.tick_params(axis='x', rotation=25)
+                has_data = True
+
+        elif graph_type == 'condition_trend':
+            weekly_k = {}
+            for record in stats_data['records']:
+                length_value = float(record.get('length') or 0)
+                weight_value = float(record.get('weight') or 0)
+                ts_value = record.get('timestamp')
+                if length_value <= 0 or weight_value <= 0 or ts_value is None:
+                    continue
+
+                k_value = (100 * weight_value) / (length_value ** 3)
+                monday = ts_value.date() - timedelta(days=ts_value.date().weekday())
+                weekly_k.setdefault(monday, []).append(k_value)
+
+            if weekly_k:
+                weeks = sorted(weekly_k.keys())
+                week_dates = [datetime.combine(week, datetime.min.time()) for week in weeks]
+                avg_k = [float(np.mean(weekly_k[week])) for week in weeks]
+
+                ax.plot(week_dates, avg_k, 'o-', color='#117864', linewidth=2, markersize=6, label='K semanal')
+                ax.axhspan(1.0, 1.4, color='#2ecc71', alpha=0.12, label='Zona óptima')
+                ax.set_title('Tendencia Semanal del Factor K', fontweight='bold')
+                ax.set_xlabel('Semana'); ax.set_ylabel('Factor de condición K')
+                ax.xaxis.set_major_formatter(mdates.DateFormatter('%d/%b'))
+                fig.autofmt_xdate(rotation=45, ha='right')
+                has_data = True
+
         # C. CURVAS DE CRECIMIENTO (Soporte Gompertz y Legacy Timeline)
         elif 'timeline' in graph_type:
             # Detectar tipo (Si es el botón viejo 'timeline', asumimos peso)
             is_weight = ('weight' in graph_type) or (graph_type == 'timeline') 
-            field = 'weight_g' if is_weight else 'length_cm'
+            field = 'weight' if is_weight else 'length'
             unit = 'g' if is_weight else 'cm'
             color = C_PURPLE if is_weight else C_ORANGE
             title_txt = "Crecimiento de Peso" if is_weight else "Crecimiento de Longitud"
 
             # 1. Agrupar Semanalmente
-            weekly_data = {}
-            for m in measurements:
-                val = get_val(m, field)
-                dt = get_date(m)
-                if val > 0 and dt:
-                    monday = dt.date() - timedelta(days=dt.date().weekday())
-                    weekly_data[monday] = weekly_data.get(monday, []) + [val]
+            weekly_data = self._build_weekly_metric_map(stats_data['records'], field)
 
             if weekly_data:
                 sorted_weeks = sorted(weekly_data.keys())
@@ -3776,7 +4448,8 @@ class MainWindow(QMainWindow):
                             if candidate[-1] < max_val * 3: 
                                 y_trend = candidate
                                 label_trend = "Tendencia (Gompertz)"
-                    except: pass
+                    except Exception as error:
+                        logger.debug("Gompertz descartado en export_individual_graph para %s: %s", graph_type, error)
 
                     # Fallback Lineal
                     if y_trend is None:
@@ -3803,8 +4476,11 @@ class MainWindow(QMainWindow):
         # GUARDADO FINAL
         # ======================================================================
         if has_data:
-            ax.legend()
+            handles, labels = ax.get_legend_handles_labels()
+            if handles:
+                ax.legend()
             ax.grid(True, linestyle='--', alpha=0.5)
+            fig.tight_layout()
             
             save_dir = os.path.join(Config.OUT_DIR, "Graficos")
             os.makedirs(save_dir, exist_ok=True)
@@ -3841,13 +4517,12 @@ class MainWindow(QMainWindow):
         if mode == "Desactivadas":
             self.anim_duration = 0
         elif mode == "Normales":
-            self.anim_duration = 150
+            self.anim_duration = 220
         else: 
-            self.anim_duration = 300
+            self.anim_duration = 420
         
-        if enabled:
-            self._setup_button_animations()
-            self._setup_widget_effects()
+        self._setup_button_animations()
+        self._setup_widget_effects()
         
         logger.info(f"✨ Animaciones: {mode} ({self.anim_duration}ms)")
 
@@ -3928,6 +4603,43 @@ class MainWindow(QMainWindow):
                 btn._original_enter = btn.enterEvent
                 btn._original_leave = btn.leaveEvent
 
+                if not hasattr(btn, '_opacity_effect'):
+                    btn._opacity_effect = QGraphicsOpacityEffect()
+                    btn._opacity_effect.setOpacity(1.0)
+                    btn.setGraphicsEffect(btn._opacity_effect)
+
+                def _make_enter_handler(button):
+                    def _on_enter(event):
+                        if self.anim_duration > 0:
+                            anim = QPropertyAnimation(button._opacity_effect, b"opacity")
+                            anim.setDuration(max(120, self.anim_duration // 2))
+                            anim.setStartValue(button._opacity_effect.opacity())
+                            anim.setEndValue(0.82)
+                            anim.setEasingCurve(QEasingCurve.OutCubic)
+                            anim.start()
+                            button._hover_anim = anim
+                        button._original_enter(event)
+                    return _on_enter
+
+                def _make_leave_handler(button):
+                    def _on_leave(event):
+                        if self.anim_duration > 0:
+                            anim = QPropertyAnimation(button._opacity_effect, b"opacity")
+                            anim.setDuration(max(140, self.anim_duration // 2))
+                            anim.setStartValue(button._opacity_effect.opacity())
+                            anim.setEndValue(1.0)
+                            anim.setEasingCurve(QEasingCurve.OutCubic)
+                            anim.start()
+                            button._hover_anim = anim
+                        else:
+                            button._opacity_effect.setOpacity(1.0)
+                        button._original_leave(event)
+                    return _on_leave
+
+                btn.enterEvent = _make_enter_handler(btn)
+                btn.leaveEvent = _make_leave_handler(btn)
+                btn._hover_setup = True
+
     def apply_appearance(self):
         """Lee los valores de los widgets y sincroniza el motor de estilos"""
         try:
@@ -3942,9 +4654,9 @@ class MainWindow(QMainWindow):
     
             if hasattr(self, 'status_bar'):
                 anim_status = {
-                "Desactivadas": "❌ SIN animaciones",
-                "Normales": "⚡ Animaciones NORMALES (150ms)",
-                "Suaves": "🌊 Animaciones SUAVES (300ms)"
+                "Desactivadas": "Animaciones desactivadas",
+                "Normales": "Animaciones normales (220ms)",
+                "Suaves": "Animaciones suaves (420ms)"
                 }.get(animations, "")
                 
                 self.status_bar.set_status(
@@ -3984,18 +4696,27 @@ class MainWindow(QMainWindow):
             row_h = 18         
             padding_val = 0     
             btn_padding = "1px 4px"
+            tab_h = 28
         elif density == "Compacta":
             row_h = 24
             padding_val = 2
             btn_padding = "4px 8px"
+            tab_h = 32
         elif density == "Cómoda":
             row_h = 42
             padding_val = 12
             btn_padding = "12px 24px"
+            tab_h = 44
+        elif density == "Táctil":
+            row_h = 52
+            padding_val = 16
+            btn_padding = "16px 28px"
+            tab_h = 54
         else: 
             row_h = 32
             padding_val = 6
             btn_padding = "8px 16px"
+            tab_h = 36
 
         # Aplicar altura de filas a todas las tablas de la app
         for table in self.findChildren(QTableWidget):
@@ -4439,6 +5160,26 @@ QPushButton[class="info"] {{
                 background-color: {border_div}; 
                 margin: 8px 2px;
             }}
+
+            /* --- BARRA SUPERIOR AMBIENTAL --- */
+            #SensorTopBar {{
+                background-color: transparent;
+                min-height: 34px;
+            }}
+
+            #SensorTopBar QPushButton {{
+                background-color: transparent;
+                border: none;
+                text-align: left;
+                color: {text_col};
+            }}
+
+            #SensorTopBar QPushButton[state="dim"]     {{ color: {c_sec_text}; }}
+            #SensorTopBar QPushButton[state="info"]    {{ color: {c_info_base}; font-weight: bold; }}
+            #SensorTopBar QPushButton[state="success"] {{ color: {c_success_base}; font-weight: bold; }}
+            #SensorTopBar QPushButton[state="warning"] {{ color: {c_warning_base}; font-weight: bold; }}
+            #SensorTopBar QPushButton[state="error"]   {{ color: {c_error_base}; font-weight: bold; }}
+            #SensorTopBar QPushButton[state="accent"]  {{ color: {c_primary_base}; font-weight: bold; }}
         """
 
         # --- CAPA DE ALTO CONTRASTE ---
@@ -4465,6 +5206,8 @@ QPushButton[class="info"] {{
         # Si tienes la barra instanciada, le actualizamos los iconos
         if hasattr(self, 'status_bar'):
              self.status_bar.update_theme_colors(current_palette)
+        if hasattr(self, 'sensor_top_bar'):
+            self.sensor_top_bar.update_theme_colors(current_palette)
              
         # 5. APLICACIÓN FINAL
         app = QApplication.instance()
@@ -4479,6 +5222,11 @@ QPushButton[class="info"] {{
         for widget in self.findChildren(QWidget):
             widget.style().unpolish(widget)
             widget.style().polish(widget)
+
+        if hasattr(self, "tabs"):
+            self.tabs.tabBar().setMinimumHeight(tab_h)
+        if hasattr(self, "sensor_top_bar"):
+            self.sensor_top_bar.set_visual_density()
 
     def _configure_widget_animations(self, enabled: bool, duration: int):
         """
@@ -4554,8 +5302,10 @@ QPushButton[class="info"] {{
         """Crea la pestaña de configuración"""
         scroll = QScrollArea()
         scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QFrame.Shape.NoFrame)
         widget = QWidget()
         layout = QVBoxLayout(widget)
+        layout.setAlignment(Qt.AlignmentFlag.AlignTop)
         
         appearance_group = QGroupBox("Apariencia")
         appearance_layout = QHBoxLayout(appearance_group)
@@ -4594,7 +5344,7 @@ QPushButton[class="info"] {{
         appearance_layout.addWidget(QLabel("Densidad:"))
         self.combo_density = QComboBox()
         self.combo_density.setCursor(Qt.PointingHandCursor)
-        self.combo_density.addItems(["Súper Compacta","Compacta", "Normal", "Cómoda"])
+        self.combo_density.addItems(["Súper Compacta", "Compacta", "Normal", "Cómoda", "Táctil"])
         self.combo_density.setToolTip(
             "Define el espaciado entre elementos de la interfaz."
         )
@@ -4647,12 +5397,55 @@ QPushButton[class="info"] {{
         
         # Botón de Re-conexión
         btn_reconnect = QPushButton("Reconectar Cámaras")
+        self.btn_reconnect_cameras = btn_reconnect
         btn_reconnect.setProperty("class", "info")
         btn_reconnect.style().unpolish(btn_reconnect) 
         btn_reconnect.style().polish(btn_reconnect)
         btn_reconnect.setToolTip("Reconectar las cámaras.")
         btn_reconnect.clicked.connect(self.reconnect_cameras)
         eng_layout.addWidget(btn_reconnect, 5, 0, 1, 4)
+
+        self.lbl_camera_hw_status = QLabel("Estado de cámaras: Verificando...")
+        self.lbl_camera_hw_status.setProperty("state", "warning")
+        self.lbl_camera_hw_status.setAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
+        self.lbl_camera_hw_status.setToolTip("Indica la disponibilidad real de cámaras para captura y calibración en vivo.")
+        eng_layout.addWidget(self.lbl_camera_hw_status, 6, 0, 1, 4)
+
+        left_state_widget = QWidget()
+        left_state_layout = QHBoxLayout(left_state_widget)
+        left_state_layout.setContentsMargins(0, 0, 0, 0)
+        left_state_layout.setSpacing(6)
+        self.lbl_cam_left_icon = QLabel()
+        self.lbl_cam_left_icon.setFixedSize(16, 16)
+        self.lbl_cam_left_icon.setToolTip("Estado de cámara lateral")
+        self.lbl_cam_left_status = QLabel("Lateral: En verificación")
+        self.lbl_cam_left_status.setProperty("state", "warning")
+        self.lbl_cam_left_status.setAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
+        self.lbl_cam_left_status.setToolTip("Semáforo de salud de cámara lateral")
+        left_state_layout.addWidget(self.lbl_cam_left_icon)
+        left_state_layout.addWidget(self.lbl_cam_left_status)
+        eng_layout.addWidget(left_state_widget, 7, 0, 1, 2)
+
+        top_state_widget = QWidget()
+        top_state_layout = QHBoxLayout(top_state_widget)
+        top_state_layout.setContentsMargins(0, 0, 0, 0)
+        top_state_layout.setSpacing(6)
+        self.lbl_cam_top_icon = QLabel()
+        self.lbl_cam_top_icon.setFixedSize(16, 16)
+        self.lbl_cam_top_icon.setToolTip("Estado de cámara cenital")
+        self.lbl_cam_top_status = QLabel("Cenital: En verificación")
+        self.lbl_cam_top_status.setProperty("state", "warning")
+        self.lbl_cam_top_status.setAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
+        self.lbl_cam_top_status.setToolTip("Semáforo de salud de cámara cenital")
+        top_state_layout.addWidget(self.lbl_cam_top_icon)
+        top_state_layout.addWidget(self.lbl_cam_top_status)
+        eng_layout.addWidget(top_state_widget, 7, 2, 1, 2)
+
+        self.lbl_cam_microcuts = QLabel("Microcortes (60s) - Lateral: 0 | Cenital: 0")
+        self.lbl_cam_microcuts.setProperty("state", "info")
+        self.lbl_cam_microcuts.setAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
+        self.lbl_cam_microcuts.setToolTip("Cantidad de microcortes de señal detectados en los últimos 60 segundos")
+        eng_layout.addWidget(self.lbl_cam_microcuts, 8, 0, 1, 4)
 
         layout.addWidget(eng_group)
         
@@ -4715,7 +5508,7 @@ QPushButton[class="info"] {{
         btn_default.setCursor(Qt.PointingHandCursor)
         btn_default.setToolTip("Carga los valores de escala predeterminados.")
         btn_default.clicked.connect(self.load_default_calibration)
-        calib_btn_layout.addWidget(btn_default, 5)
+        calib_btn_layout.addWidget(btn_default, 7)
         
         btn_apply_manual = QPushButton("Aplicar Escalas")
         btn_apply_manual.setProperty("class", "success")
@@ -4724,7 +5517,17 @@ QPushButton[class="info"] {{
         btn_apply_manual.setCursor(Qt.PointingHandCursor)
         btn_apply_manual.setToolTip("Aplica estos valores de escala inmediatamente.")
         btn_apply_manual.clicked.connect(self.apply_manual_calibration)
-        calib_btn_layout.addWidget(btn_apply_manual, 5)
+        calib_btn_layout.addWidget(btn_apply_manual, 7)
+
+        btn_open_scale_calibrator = QPushButton("Abrir Calibrador de Escala")
+        self.btn_scale_calibrator = btn_open_scale_calibrator
+        btn_open_scale_calibrator.setProperty("class", "info")
+        btn_open_scale_calibrator.style().unpolish(btn_open_scale_calibrator)
+        btn_open_scale_calibrator.style().polish(btn_open_scale_calibrator)
+        btn_open_scale_calibrator.setCursor(Qt.PointingHandCursor)
+        btn_open_scale_calibrator.setToolTip("Calcula cm/px dentro de la app marcando dos puntos y distancia real.")
+        btn_open_scale_calibrator.clicked.connect(self.open_scale_calibration_dialog)
+        calib_btn_layout.addWidget(btn_open_scale_calibrator, 2)
         
         manual_layout.addLayout(calib_btn_layout, 3, 0, 1, 3) 
         
@@ -4770,6 +5573,65 @@ QPushButton[class="info"] {{
         detection_layout.addWidget(self.spin_confidence, 2, 1)
         
         layout.addWidget(detection_group)
+
+        env_group = QGroupBox("Rangos de Alertas Ambientales")
+        env_group.setToolTip("Define los umbrales para alertar cada variable en la barra superior ambiental.")
+        env_layout = QGridLayout(env_group)
+
+        env_layout.addWidget(QLabel("Variable"), 0, 0)
+        env_layout.addWidget(QLabel("Mín"), 0, 1)
+        env_layout.addWidget(QLabel("Máx"), 0, 2)
+
+        env_layout.addWidget(QLabel("Temperatura Agua (°C)"), 1, 0)
+        self.spin_env_temp_min = QDoubleSpinBox(); self.spin_env_temp_min.setRange(-10.0, 60.0); self.spin_env_temp_min.setDecimals(1)
+        self.spin_env_temp_max = QDoubleSpinBox(); self.spin_env_temp_max.setRange(-10.0, 60.0); self.spin_env_temp_max.setDecimals(1)
+        self.spin_env_temp_min.setValue(self.sensor_env_ranges["temp_agua"][0]); self.spin_env_temp_max.setValue(self.sensor_env_ranges["temp_agua"][1])
+        self.spin_env_temp_min.setToolTip("Umbral mínimo de temperatura de agua.")
+        self.spin_env_temp_max.setToolTip("Umbral máximo de temperatura de agua.")
+        env_layout.addWidget(self.spin_env_temp_min, 1, 1); env_layout.addWidget(self.spin_env_temp_max, 1, 2)
+
+        env_layout.addWidget(QLabel("pH"), 2, 0)
+        self.spin_env_ph_min = QDoubleSpinBox(); self.spin_env_ph_min.setRange(0.0, 14.0); self.spin_env_ph_min.setDecimals(2)
+        self.spin_env_ph_max = QDoubleSpinBox(); self.spin_env_ph_max.setRange(0.0, 14.0); self.spin_env_ph_max.setDecimals(2)
+        self.spin_env_ph_min.setValue(self.sensor_env_ranges["ph"][0]); self.spin_env_ph_max.setValue(self.sensor_env_ranges["ph"][1])
+        self.spin_env_ph_min.setToolTip("Umbral mínimo de pH.")
+        self.spin_env_ph_max.setToolTip("Umbral máximo de pH.")
+        env_layout.addWidget(self.spin_env_ph_min, 2, 1); env_layout.addWidget(self.spin_env_ph_max, 2, 2)
+
+        env_layout.addWidget(QLabel("Conductividad (µS/cm)"), 3, 0)
+        self.spin_env_cond_min = QDoubleSpinBox(); self.spin_env_cond_min.setRange(0.0, 10000.0); self.spin_env_cond_min.setDecimals(1)
+        self.spin_env_cond_max = QDoubleSpinBox(); self.spin_env_cond_max.setRange(0.0, 10000.0); self.spin_env_cond_max.setDecimals(1)
+        self.spin_env_cond_min.setValue(self.sensor_env_ranges["cond"][0]); self.spin_env_cond_max.setValue(self.sensor_env_ranges["cond"][1])
+        self.spin_env_cond_min.setToolTip("Umbral mínimo de conductividad.")
+        self.spin_env_cond_max.setToolTip("Umbral máximo de conductividad.")
+        env_layout.addWidget(self.spin_env_cond_min, 3, 1); env_layout.addWidget(self.spin_env_cond_max, 3, 2)
+
+        env_layout.addWidget(QLabel("Turbidez (NTU)"), 4, 0)
+        self.spin_env_turb_min = QDoubleSpinBox(); self.spin_env_turb_min.setRange(0.0, 2000.0); self.spin_env_turb_min.setDecimals(1)
+        self.spin_env_turb_max = QDoubleSpinBox(); self.spin_env_turb_max.setRange(0.0, 2000.0); self.spin_env_turb_max.setDecimals(1)
+        self.spin_env_turb_min.setValue(self.sensor_env_ranges["turb"][0]); self.spin_env_turb_max.setValue(self.sensor_env_ranges["turb"][1])
+        self.spin_env_turb_min.setToolTip("Umbral mínimo de turbidez.")
+        self.spin_env_turb_max.setToolTip("Umbral máximo de turbidez.")
+        env_layout.addWidget(self.spin_env_turb_min, 4, 1); env_layout.addWidget(self.spin_env_turb_max, 4, 2)
+
+        env_layout.addWidget(QLabel("Oxígeno Disuelto (mg/L)"), 5, 0)
+        self.spin_env_do_min = QDoubleSpinBox(); self.spin_env_do_min.setRange(0.0, 30.0); self.spin_env_do_min.setDecimals(1)
+        self.spin_env_do_max = QDoubleSpinBox(); self.spin_env_do_max.setRange(0.0, 30.0); self.spin_env_do_max.setDecimals(1)
+        self.spin_env_do_min.setValue(self.sensor_env_ranges["do"][0]); self.spin_env_do_max.setValue(self.sensor_env_ranges["do"][1])
+        self.spin_env_do_min.setToolTip("Umbral mínimo de oxígeno disuelto.")
+        self.spin_env_do_max.setToolTip("Umbral máximo de oxígeno disuelto.")
+        env_layout.addWidget(self.spin_env_do_min, 5, 1); env_layout.addWidget(self.spin_env_do_max, 5, 2)
+
+        for env_spin in (
+            self.spin_env_temp_min, self.spin_env_temp_max,
+            self.spin_env_ph_min, self.spin_env_ph_max,
+            self.spin_env_cond_min, self.spin_env_cond_max,
+            self.spin_env_turb_min, self.spin_env_turb_max,
+            self.spin_env_do_min, self.spin_env_do_max,
+        ):
+            env_spin.valueChanged.connect(self._apply_sensor_ranges_from_ui)
+
+        layout.addWidget(env_group)
 
         validation_group = QGroupBox("Parámetros de Validación (Medidas Reales)")
         validation_layout = QGridLayout(validation_group)
@@ -4832,6 +5694,7 @@ QPushButton[class="info"] {{
 
         # Botón de Calibración Unificado
         btn_fine_tune = QPushButton("Abrir Calibrador de Color en Vivo")
+        self.btn_fine_tune = btn_fine_tune
         btn_fine_tune.setProperty("class", "info")
         btn_fine_tune.style().unpolish(btn_fine_tune)
         btn_fine_tune.style().polish(btn_fine_tune)
@@ -4842,6 +5705,7 @@ QPushButton[class="info"] {{
         layout.addWidget(chroma_group)
 
         btn_save_config = QPushButton("Guardar Configuración")
+        self.btn_save_config = btn_save_config
         btn_save_config.setProperty("class", "primary")
         btn_save_config.style().unpolish(btn_save_config)
         btn_save_config.style().polish(btn_save_config)
@@ -4850,11 +5714,226 @@ QPushButton[class="info"] {{
         btn_save_config.setToolTip("Guarda todos los cambios actuales en el archivo de configuración.")
         layout.addWidget(btn_save_config)
 
-        for w in (self.combo_theme, self.combo_font_size, self.combo_density):
-            w.currentTextChanged.connect(self.apply_appearance)
+        self.btn_reset_general_config = QPushButton("Restablecer Configuración General")
+        self.btn_reset_general_config.setProperty("class", "warning")
+        self.btn_reset_general_config.style().unpolish(self.btn_reset_general_config)
+        self.btn_reset_general_config.style().polish(self.btn_reset_general_config)
+        self.btn_reset_general_config.setCursor(Qt.PointingHandCursor)
+        self.btn_reset_general_config.setToolTip("Restablece apariencia, hardware, filtros y rangos ambientales a valores recomendados.")
+        self.btn_reset_general_config.clicked.connect(self.reset_general_settings)
+        layout.addWidget(self.btn_reset_general_config)
+
+        self.lbl_settings_dirty = QLabel("Configuración guardada")
+        self.lbl_settings_dirty.setProperty("state", "success")
+        self.lbl_settings_dirty.setAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
+        layout.addWidget(self.lbl_settings_dirty)
+
+        for section in (
+            appearance_group,
+            eng_group,
+            manual_group,
+            detection_group,
+            env_group,
+            validation_group,
+            chroma_group,
+        ):
+            section.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Maximum)
+
+        layout.addStretch(1)
+
+        self._update_settings_camera_indicator(self.cameras_connected)
+        self._set_fine_tune_enabled(self.cameras_connected)
+        self._setup_settings_dirty_tracking()
+        self._set_settings_dirty(False)
 
         scroll.setWidget(widget)
         return scroll
+
+    def _set_settings_dirty(self, dirty: bool, reason: str = "") -> None:
+        """Actualiza estado visual de cambios pendientes en Configuración."""
+        self.settings_dirty = bool(dirty)
+
+        label = getattr(self, "lbl_settings_dirty", None)
+        if label is None:
+            return
+
+        if self.settings_dirty:
+            text = "Cambios sin guardar"
+            if reason:
+                text = f"Cambios sin guardar ({reason})"
+            state = "warning"
+        else:
+            text = "Configuración guardada"
+            state = "success"
+
+        label.setText(text)
+        label.setProperty("state", state)
+        label.style().unpolish(label)
+        label.style().polish(label)
+
+    def _mark_settings_dirty(self, _value=None, reason: str = ""):
+        """Marca configuración como pendiente de guardado cuando cambia un control."""
+        if self._settings_change_guard:
+            return
+        self._set_settings_dirty(True, reason)
+
+    def _setup_settings_dirty_tracking(self) -> None:
+        """Conecta señales de widgets de configuración para detectar cambios sin guardar."""
+        tracked_widgets = [
+            getattr(self, 'combo_theme', None),
+            getattr(self, 'combo_font_size', None),
+            getattr(self, 'combo_density', None),
+            getattr(self, 'combo_animations', None),
+            getattr(self, 'chk_high_contrast', None),
+            getattr(self, 'spin_cam_left', None),
+            getattr(self, 'spin_cam_top', None),
+            getattr(self, 'spin_min_area', None),
+            getattr(self, 'spin_max_area', None),
+            getattr(self, 'spin_confidence', None),
+            getattr(self, 'spin_min_length', None),
+            getattr(self, 'spin_max_length', None),
+            getattr(self, 'spin_scale_front_left', None),
+            getattr(self, 'spin_scale_back_left', None),
+            getattr(self, 'spin_scale_front_top', None),
+            getattr(self, 'spin_scale_back_top', None),
+            getattr(self, 'spin_hue_min_lat', None),
+            getattr(self, 'spin_hue_max_lat', None),
+            getattr(self, 'spin_sat_min_lat', None),
+            getattr(self, 'spin_sat_max_lat', None),
+            getattr(self, 'spin_val_min_lat', None),
+            getattr(self, 'spin_val_max_lat', None),
+            getattr(self, 'spin_hue_min_top', None),
+            getattr(self, 'spin_hue_max_top', None),
+            getattr(self, 'spin_sat_min_top', None),
+            getattr(self, 'spin_sat_max_top', None),
+            getattr(self, 'spin_val_min_top', None),
+            getattr(self, 'spin_val_max_top', None),
+            getattr(self, 'spin_env_temp_min', None),
+            getattr(self, 'spin_env_temp_max', None),
+            getattr(self, 'spin_env_ph_min', None),
+            getattr(self, 'spin_env_ph_max', None),
+            getattr(self, 'spin_env_cond_min', None),
+            getattr(self, 'spin_env_cond_max', None),
+            getattr(self, 'spin_env_turb_min', None),
+            getattr(self, 'spin_env_turb_max', None),
+            getattr(self, 'spin_env_do_min', None),
+            getattr(self, 'spin_env_do_max', None),
+        ]
+
+        for widget in tracked_widgets:
+            if widget is None:
+                continue
+            if getattr(widget, '_dirty_tracking_setup', False):
+                continue
+
+            if isinstance(widget, QComboBox):
+                widget.currentIndexChanged.connect(lambda _idx, w=widget: self._mark_settings_dirty(reason=w.objectName() or "combo"))
+            elif isinstance(widget, QCheckBox):
+                widget.stateChanged.connect(lambda _state, w=widget: self._mark_settings_dirty(reason=w.text() or "check"))
+            else:
+                try:
+                    widget.valueChanged.connect(lambda _value, w=widget: self._mark_settings_dirty(reason=w.objectName() or "valor"))
+                except Exception:
+                    continue
+
+            widget._dirty_tracking_setup = True
+
+    def _validate_settings_ranges(self, show_message: bool = True) -> bool:
+        """Valida consistencia de rangos antes de aplicar/guardar configuración."""
+        issues = []
+
+        if self.spin_min_area.value() >= self.spin_max_area.value():
+            issues.append("Área mínima debe ser menor que área máxima.")
+
+        if self.spin_min_length.value() >= self.spin_max_length.value():
+            issues.append("Longitud mínima debe ser menor que longitud máxima.")
+
+        if self.spin_cam_left.value() == self.spin_cam_top.value():
+            issues.append("Cámara lateral y cenital no deben usar el mismo índice.")
+
+        env_pairs = [
+            ("Temperatura agua", self.spin_env_temp_min.value(), self.spin_env_temp_max.value()),
+            ("pH", self.spin_env_ph_min.value(), self.spin_env_ph_max.value()),
+            ("Conductividad", self.spin_env_cond_min.value(), self.spin_env_cond_max.value()),
+            ("Turbidez", self.spin_env_turb_min.value(), self.spin_env_turb_max.value()),
+            ("Oxígeno disuelto", self.spin_env_do_min.value(), self.spin_env_do_max.value()),
+        ]
+        for name, min_v, max_v in env_pairs:
+            if min_v >= max_v:
+                issues.append(f"{name}: mínimo debe ser menor que máximo.")
+
+        hsv_pairs = [
+            ("HSV Lateral", self.spin_hue_min_lat.value(), self.spin_hue_max_lat.value(), self.spin_sat_min_lat.value(), self.spin_sat_max_lat.value(), self.spin_val_min_lat.value(), self.spin_val_max_lat.value()),
+            ("HSV Cenital", self.spin_hue_min_top.value(), self.spin_hue_max_top.value(), self.spin_sat_min_top.value(), self.spin_sat_max_top.value(), self.spin_val_min_top.value(), self.spin_val_max_top.value()),
+        ]
+        for name, h_min, h_max, s_min, s_max, v_min, v_max in hsv_pairs:
+            if h_min > h_max:
+                issues.append(f"{name}: Hue min no puede ser mayor que Hue max.")
+            if s_min > s_max:
+                issues.append(f"{name}: Sat min no puede ser mayor que Sat max.")
+            if v_min > v_max:
+                issues.append(f"{name}: Val min no puede ser mayor que Val max.")
+
+        if issues and show_message:
+            QMessageBox.warning(
+                self,
+                "Rangos inválidos",
+                "Revise los siguientes campos antes de guardar:\n\n- " + "\n- ".join(issues),
+            )
+            if hasattr(self, 'status_bar'):
+                self.status_bar.set_status("Hay rangos inválidos en Configuración", "warning")
+
+        return len(issues) == 0
+
+    def reset_general_settings(self):
+        """Restablece configuración general a valores recomendados de operación."""
+        reply = QMessageBox.question(
+            self,
+            "Restablecer configuración",
+            "¿Desea restablecer la configuración general?\n\nEsto restablece apariencia, hardware, filtros, validación y rangos ambientales.",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+        )
+        if reply != QMessageBox.StandardButton.Yes:
+            return
+
+        self._settings_change_guard = True
+        try:
+            defaults = self._general_defaults
+
+            self.combo_theme.setCurrentText(defaults['theme'])
+            self.combo_font_size.setCurrentText(defaults['font_size'])
+            self.combo_density.setCurrentText(defaults['density'])
+            self.combo_animations.setCurrentText(defaults['animations'])
+            self.chk_high_contrast.setChecked(defaults['high_contrast'])
+
+            self.spin_cam_left.setValue(defaults['cam_left_index'])
+            self.spin_cam_top.setValue(defaults['cam_top_index'])
+            self.spin_min_area.setValue(defaults['min_contour_area'])
+            self.spin_max_area.setValue(defaults['max_contour_area'])
+            self.spin_confidence.setValue(defaults['confidence_threshold'])
+            self.spin_min_length.setValue(defaults['min_length_cm'])
+            self.spin_max_length.setValue(defaults['max_length_cm'])
+
+            self.spin_env_temp_min.setValue(defaults['sensor_env_ranges']['temp_agua'][0])
+            self.spin_env_temp_max.setValue(defaults['sensor_env_ranges']['temp_agua'][1])
+            self.spin_env_ph_min.setValue(defaults['sensor_env_ranges']['ph'][0])
+            self.spin_env_ph_max.setValue(defaults['sensor_env_ranges']['ph'][1])
+            self.spin_env_cond_min.setValue(defaults['sensor_env_ranges']['cond'][0])
+            self.spin_env_cond_max.setValue(defaults['sensor_env_ranges']['cond'][1])
+            self.spin_env_turb_min.setValue(defaults['sensor_env_ranges']['turb'][0])
+            self.spin_env_turb_max.setValue(defaults['sensor_env_ranges']['turb'][1])
+            self.spin_env_do_min.setValue(defaults['sensor_env_ranges']['do'][0])
+            self.spin_env_do_max.setValue(defaults['sensor_env_ranges']['do'][1])
+
+            self._apply_sensor_ranges_from_ui()
+            self.apply_appearance()
+            self.update_cache()
+        finally:
+            self._settings_change_guard = False
+
+        self._set_settings_dirty(True, "restablecida")
+        if hasattr(self, 'status_bar'):
+            self.status_bar.set_status("Configuración general restablecida. Falta guardar cambios.", "warning")
     
     def _add_hsv_spin(self, layout, label, row, col, default, max_val):
         """Helper para crear spins HSV rápidamente"""
@@ -4934,6 +6013,251 @@ QPushButton[class="info"] {{
             w.style().unpolish(w)
             w.style().polish(w)
 
+    def open_scale_calibration_dialog(self):
+        """Calibrador interno de escala (cm/px) por cámara y zona con sobrescritura opcional."""
+        left_ready = bool(self.cap_left and hasattr(self.cap_left, "isOpened") and self.cap_left.isOpened())
+        top_ready = bool(self.cap_top and hasattr(self.cap_top, "isOpened") and self.cap_top.isOpened())
+
+        if not (left_ready or top_ready):
+            QMessageBox.warning(self, "Sin cámaras", "No hay cámaras activas para calibrar escala.")
+            return
+
+        dialog = QDialog(self)
+        dialog.setWindowTitle("Calibrador de Escala (cm/px)")
+        dialog.setMinimumSize(980, 720)
+        root = QVBoxLayout(dialog)
+
+        info = QLabel(
+            "1) Seleccione cámara y zona.  2) Capture imagen.  3) Marque dos puntos.\n"
+            "4) Ingrese distancia real en cm.  5) Aplique la escala calculada."
+        )
+        info.setProperty("state", "info")
+        root.addWidget(info)
+
+        controls = QGridLayout()
+        controls.addWidget(QLabel("Cámara:"), 0, 0)
+        combo_camera = QComboBox()
+        if left_ready:
+            combo_camera.addItem("Lateral", "left")
+        if top_ready:
+            combo_camera.addItem("Cenital", "top")
+        controls.addWidget(combo_camera, 0, 1)
+
+        controls.addWidget(QLabel("Zona de escala:"), 0, 2)
+        combo_zone = QComboBox()
+        combo_zone.addItem("Frente", "front")
+        combo_zone.addItem("Fondo", "back")
+        controls.addWidget(combo_zone, 0, 3)
+
+        controls.addWidget(QLabel("Distancia real (cm):"), 1, 0)
+        spin_distance_cm = QDoubleSpinBox()
+        spin_distance_cm.setRange(0.1, 500.0)
+        spin_distance_cm.setDecimals(2)
+        spin_distance_cm.setValue(10.0)
+        spin_distance_cm.setSuffix(" cm")
+        controls.addWidget(spin_distance_cm, 1, 1)
+
+        chk_save_now = QCheckBox("Guardar configuración al aplicar")
+        chk_save_now.setChecked(True)
+        controls.addWidget(chk_save_now, 1, 2, 1, 2)
+        root.addLayout(controls)
+
+        preview = QLabel("Capture una imagen para comenzar")
+        preview.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        preview.setMinimumSize(900, 500)
+        preview.setStyleSheet("border: 1px solid #666; background-color: #111;")
+        root.addWidget(preview)
+
+        lbl_result = QLabel("Escala calculada: -")
+        lbl_result.setProperty("state", "warning")
+        root.addWidget(lbl_result)
+
+        buttons = QHBoxLayout()
+        btn_capture = QPushButton("Capturar Imagen")
+        btn_clear = QPushButton("Limpiar Puntos")
+        btn_apply = QPushButton("Aplicar Escala")
+        btn_close = QPushButton("Cerrar")
+        btn_apply.setProperty("class", "success")
+        btn_close.setProperty("class", "warning")
+        buttons.addWidget(btn_capture)
+        buttons.addWidget(btn_clear)
+        buttons.addStretch(1)
+        buttons.addWidget(btn_apply)
+        buttons.addWidget(btn_close)
+        root.addLayout(buttons)
+
+        state = {
+            'frame': None,
+            'points': [],
+            'scale': None,
+            'render_rect': (0, 0, 1, 1),
+        }
+
+        def render_frame_with_points():
+            frame = state['frame']
+            if frame is None:
+                preview.setText("Capture una imagen para comenzar")
+                preview.setPixmap(QPixmap())
+                return
+
+            draw = frame.copy()
+            if len(state['points']) >= 1:
+                x1, y1 = state['points'][0]
+                cv2.circle(draw, (x1, y1), 7, (0, 255, 255), -1)
+            if len(state['points']) >= 2:
+                x1, y1 = state['points'][0]
+                x2, y2 = state['points'][1]
+                cv2.circle(draw, (x2, y2), 7, (0, 255, 255), -1)
+                cv2.line(draw, (x1, y1), (x2, y2), (255, 255, 0), 2)
+                px_dist = float(np.hypot(x2 - x1, y2 - y1))
+                cv2.putText(draw, f"px: {px_dist:.2f}", (15, 35), cv2.FONT_HERSHEY_SIMPLEX, 0.9, (0, 255, 255), 2)
+
+            rgb = cv2.cvtColor(draw, cv2.COLOR_BGR2RGB)
+            h, w, ch = rgb.shape
+            qimg = QImage(rgb.data, w, h, ch * w, QImage.Format.Format_RGB888)
+            pix = QPixmap.fromImage(qimg)
+
+            target_size = preview.size()
+            scaled = pix.scaled(target_size, Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.SmoothTransformation)
+
+            canvas = QPixmap(target_size)
+            canvas.fill(Qt.GlobalColor.black)
+            painter = QPainter(canvas)
+            ox = (target_size.width() - scaled.width()) // 2
+            oy = (target_size.height() - scaled.height()) // 2
+            painter.drawPixmap(ox, oy, scaled)
+            painter.end()
+
+            state['render_rect'] = (ox, oy, scaled.width(), scaled.height())
+            preview.setPixmap(canvas)
+
+        def map_click_to_frame(click_pos):
+            frame = state['frame']
+            if frame is None:
+                return None
+
+            ox, oy, rw, rh = state['render_rect']
+            cx, cy = click_pos.x(), click_pos.y()
+            if cx < ox or cy < oy or cx > (ox + rw) or cy > (oy + rh):
+                return None
+
+            fh, fw = frame.shape[:2]
+            rel_x = (cx - ox) / max(1, rw)
+            rel_y = (cy - oy) / max(1, rh)
+            px = int(rel_x * fw)
+            py = int(rel_y * fh)
+            px = max(0, min(fw - 1, px))
+            py = max(0, min(fh - 1, py))
+            return (px, py)
+
+        def on_preview_click(event):
+            point = map_click_to_frame(event.pos())
+            if point is None:
+                return
+
+            if len(state['points']) >= 2:
+                state['points'] = []
+                state['scale'] = None
+
+            state['points'].append(point)
+
+            if len(state['points']) == 2:
+                (x1, y1), (x2, y2) = state['points']
+                px_dist = float(np.hypot(x2 - x1, y2 - y1))
+                if px_dist <= 0:
+                    state['scale'] = None
+                    lbl_result.setText("Escala calculada: error (distancia en px inválida)")
+                else:
+                    cm_dist = float(spin_distance_cm.value())
+                    state['scale'] = cm_dist / px_dist
+                    lbl_result.setText(f"Escala calculada: {state['scale']:.6f} cm/px  |  Dist px: {px_dist:.2f}")
+
+            render_frame_with_points()
+
+        preview.mousePressEvent = on_preview_click
+
+        def capture_frame():
+            camera_key = combo_camera.currentData()
+            cap = self.cap_left if camera_key == "left" else self.cap_top
+            if cap is None or not cap.isOpened():
+                QMessageBox.warning(dialog, "Sin señal", "La cámara seleccionada no está disponible.")
+                return
+
+            ret, frame = cap.read()
+            if not ret or frame is None:
+                QMessageBox.warning(dialog, "Sin frame", "No fue posible capturar imagen de la cámara seleccionada.")
+                return
+
+            state['frame'] = frame.copy()
+            state['points'] = []
+            state['scale'] = None
+            lbl_result.setText("Escala calculada: -")
+            render_frame_with_points()
+
+        def clear_points():
+            state['points'] = []
+            state['scale'] = None
+            lbl_result.setText("Escala calculada: -")
+            render_frame_with_points()
+
+        def apply_scale():
+            if state['scale'] is None or state['scale'] <= 0:
+                QMessageBox.warning(dialog, "Escala inválida", "Debe capturar imagen y marcar dos puntos válidos.")
+                return
+
+            camera_key = combo_camera.currentData()
+            zone_key = combo_zone.currentData()
+
+            if camera_key == "left" and zone_key == "front":
+                target_spin = self.spin_scale_front_left
+                target_name = "Lateral - Frente"
+            elif camera_key == "left" and zone_key == "back":
+                target_spin = self.spin_scale_back_left
+                target_name = "Lateral - Fondo"
+            elif camera_key == "top" and zone_key == "front":
+                target_spin = self.spin_scale_front_top
+                target_name = "Cenital - Frente"
+            else:
+                target_spin = self.spin_scale_back_top
+                target_name = "Cenital - Fondo"
+
+            old_value = float(target_spin.value())
+            new_value = float(state['scale'])
+
+            reply = QMessageBox.question(
+                dialog,
+                "Sobrescribir escala",
+                f"Aplicar nueva escala en {target_name}?\n\nActual: {old_value:.6f} cm/px\nNueva: {new_value:.6f} cm/px",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
+            )
+            if reply != QMessageBox.StandardButton.Yes:
+                return
+
+            target_spin.setValue(new_value)
+            self.apply_manual_calibration(silent=True)
+
+            if chk_save_now.isChecked():
+                self.save_config()
+            else:
+                self.status_bar.set_status(f"Escala aplicada en {target_name}: {new_value:.6f} cm/px", "success")
+
+            QMessageBox.information(dialog, "Escala aplicada", f"Nueva escala aplicada en {target_name}: {new_value:.6f} cm/px")
+
+        btn_capture.clicked.connect(capture_frame)
+        btn_clear.clicked.connect(clear_points)
+        btn_apply.clicked.connect(apply_scale)
+        btn_close.clicked.connect(dialog.accept)
+
+        was_main_timer_active = bool(hasattr(self, 'timer') and self.timer.isActive())
+        if was_main_timer_active:
+            self.timer.stop()
+
+        dialog.exec()
+
+        if was_main_timer_active and self.cameras_connected and hasattr(self, 'timer'):
+            fps_ms = int(1000 / max(1, Config.PREVIEW_FPS))
+            self.timer.start(fps_ms)
+
     def set_camera_placeholder(self, label):
         """Configura el estado visual cuando no hay señal de video."""
         if label is None: return
@@ -4974,6 +6298,209 @@ QPushButton[class="info"] {{
         self.btn_auto_capture.setEnabled(enabled)
         self.btn_manual_capture.setEnabled(enabled)
 
+    def _set_camera_block_tooltip(self, widget, cameras_ok: bool) -> None:
+        """Aplica/recupera tooltip base con mensaje de bloqueo por cámaras."""
+        if widget is None:
+            return
+
+        base_tip = getattr(widget, "_base_tooltip", None)
+        if base_tip is None:
+            base_tip = widget.toolTip() or ""
+            setattr(widget, "_base_tooltip", base_tip)
+
+        if cameras_ok:
+            widget.setToolTip(base_tip)
+            return
+
+        lock_msg = "Requiere cámaras activas. Revise la conexión en Configuración."
+        widget.setToolTip(f"{base_tip}\n\n{lock_msg}" if base_tip else lock_msg)
+
+    def _set_fine_tune_enabled(self, cameras_ok: bool) -> None:
+        """Habilita o bloquea calibradores en vivo según estado real de cámaras."""
+        for btn in (getattr(self, "btn_fine_tune", None), getattr(self, "btn_scale_calibrator", None)):
+            if btn is None:
+                continue
+            btn.setEnabled(bool(cameras_ok))
+            self._set_camera_block_tooltip(btn, bool(cameras_ok))
+
+    def _update_settings_camera_indicator(self, cameras_ok: bool, details: str = "") -> None:
+        """Refuerza visualmente el estado de conexión dentro de la pestaña Configuración."""
+        label = getattr(self, "lbl_camera_hw_status", None)
+        if label is None:
+            return
+
+        if cameras_ok:
+            text = "Estado de cámaras: Conectadas y operativas"
+            state = "success"
+        else:
+            text = "Estado de cámaras: No disponibles"
+            state = "error"
+
+        if details:
+            text = f"{text} ({details})"
+
+        label.setText(text)
+        label.setProperty("state", state)
+        label.style().unpolish(label)
+        label.style().polish(label)
+        label.setToolTip(text)
+
+    def _set_single_camera_health_label(self, label, camera_name: str, state: str, detail: str = "") -> None:
+        """Actualiza un indicador tipo semáforo para una cámara específica."""
+        if label is None:
+            return
+
+        if state == "success":
+            base_text = "Estable"
+            icon_name = "fa5s.check-circle"
+            icon_color = "#2a9d8f"
+        elif state == "warning":
+            base_text = "Inestable"
+            icon_name = "fa5s.exclamation-circle"
+            icon_color = "#f39c12"
+        else:
+            base_text = "Sin señal"
+            icon_name = "fa5s.times-circle"
+            icon_color = "#e74c3c"
+
+        text = f"{camera_name}: {base_text}"
+        if detail:
+            text = f"{text} ({detail})"
+
+        icon_label = None
+        if camera_name == "Lateral":
+            icon_label = getattr(self, "lbl_cam_left_icon", None)
+        elif camera_name == "Cenital":
+            icon_label = getattr(self, "lbl_cam_top_icon", None)
+
+        if icon_label is not None:
+            pix = qta.icon(icon_name, color=icon_color).pixmap(16, 16)
+            icon_label.setPixmap(pix)
+            icon_label.setToolTip(text)
+
+        label.setText(text)
+        label.setProperty("state", state)
+        label.style().unpolish(label)
+        label.style().polish(label)
+        label.setToolTip(text)
+
+    def _prune_microcuts_window(self) -> None:
+        """Mantiene únicamente microcortes registrados en los últimos 60 segundos."""
+        now = time.time()
+        while self._microcuts_left and now - self._microcuts_left[0] > 60.0:
+            self._microcuts_left.popleft()
+        while self._microcuts_top and now - self._microcuts_top[0] > 60.0:
+            self._microcuts_top.popleft()
+
+    def _register_microcut(self, camera_key: str) -> None:
+        """Registra un microcorte para diagnóstico por cámara."""
+        if camera_key == "left":
+            self._microcuts_left.append(time.time())
+        elif camera_key == "top":
+            self._microcuts_top.append(time.time())
+        self._prune_microcuts_window()
+
+    def _update_microcuts_indicator(self) -> None:
+        """Actualiza contador visual de microcortes en la pestaña Configuración."""
+        self._prune_microcuts_window()
+        label = getattr(self, "lbl_cam_microcuts", None)
+        if label is None:
+            return
+
+        left_count = len(self._microcuts_left)
+        top_count = len(self._microcuts_top)
+        label.setText(f"Microcortes (60s) - Lateral: {left_count} | Cenital: {top_count}")
+
+        total = left_count + top_count
+        if total == 0:
+            state = "success"
+        elif total <= 3:
+            state = "warning"
+        else:
+            state = "error"
+
+        label.setProperty("state", state)
+        label.style().unpolish(label)
+        label.style().polish(label)
+        label.setToolTip("Si el contador crece seguido, revisar cable USB, puerto o alimentación.")
+
+    def _update_camera_health_indicators(self, left_state: str, top_state: str, left_detail: str = "", top_detail: str = "") -> None:
+        """Sincroniza semáforo por cámara en pestaña Configuración."""
+        self._cam_health_left = left_state
+        self._cam_health_top = top_state
+        self._set_single_camera_health_label(getattr(self, "lbl_cam_left_status", None), "Lateral", left_state, left_detail)
+        self._set_single_camera_health_label(getattr(self, "lbl_cam_top_status", None), "Cenital", top_state, top_detail)
+        self._update_microcuts_indicator()
+
+    def _request_auto_reconnect(self, reason: str) -> None:
+        """Lanza recuperación automática acotada cuando la señal de cámara cae."""
+        if self._auto_reconnect_running:
+            return
+
+        if self._auto_reconnect_attempts >= 2:
+            self.status_bar.set_status("Reconexión automática agotada. Use 'Reconectar Cámaras'.", "warning")
+            return
+
+        self._auto_reconnect_running = True
+        next_attempt = self._auto_reconnect_attempts + 1
+        self.status_bar.set_status(f"Recuperación automática de cámaras ({next_attempt}/2): {reason}", "warning")
+        QTimer.singleShot(1100, self._run_auto_reconnect)
+
+    def _run_auto_reconnect(self) -> None:
+        """Ejecuta un intento de reconexión automática sin popups."""
+        self._auto_reconnect_attempts += 1
+        ok = self.reconnect_cameras(interactive=False)
+        self._auto_reconnect_running = False
+
+        if ok:
+            self._auto_reconnect_attempts = 0
+            self.status_bar.set_status("Cámaras recuperadas automáticamente", "success")
+        elif self._auto_reconnect_attempts < 2:
+            self._request_auto_reconnect("reintento")
+
+    def _apply_camera_blocking_tooltips(self, cameras_ok: bool) -> None:
+        """Sincroniza tooltips de pestaña automática y widgets dependientes de cámara."""
+        if hasattr(self, "tabs") and self.tabs is not None:
+            tab_tip = "Medición automática desde cámara y sensores"
+            if not cameras_ok:
+                tab_tip += "\n\nBloqueada: no se detectaron cámaras activas"
+            self.tabs.tabBar().setTabToolTip(0, tab_tip)
+
+        widgets = [
+            getattr(self, "btn_capture", None),
+            getattr(self, "btn_auto_capture", None),
+            getattr(self, "btn_manual_capture", None),
+            getattr(self, "lbl_left", None),
+            getattr(self, "lbl_top", None),
+            getattr(self, "lbl_manual_left", None),
+            getattr(self, "lbl_manual_top", None),
+            getattr(self, "btn_fine_tune", None),
+        ]
+        for widget in widgets:
+            self._set_camera_block_tooltip(widget, cameras_ok)
+
+        self._set_fine_tune_enabled(cameras_ok)
+        self._update_settings_camera_indicator(cameras_ok)
+        if cameras_ok:
+            self._update_camera_health_indicators("success", "success", "Operativa", "Operativa")
+        else:
+            self._update_camera_health_indicators("error", "error", "Desconectada", "Desconectada")
+
+    def _configure_camera_tabs(self, cameras_ok: bool, choose_startup: bool = False) -> None:
+        """Habilita/bloquea pestañas según estado de cámaras y define pestaña inicial."""
+        if not hasattr(self, "tabs"):
+            return
+
+        self.tabs.setTabEnabled(0, cameras_ok)
+        self._apply_camera_blocking_tooltips(cameras_ok)
+
+        if cameras_ok:
+            if choose_startup:
+                self.tabs.setCurrentIndex(0)
+        else:
+            if choose_startup or self.tabs.currentIndex() == 0:
+                self.tabs.setCurrentIndex(1)
+
     def start_cameras(self):
         """
         Inicia el streaming de video con arquitectura de estados
@@ -4996,25 +6523,19 @@ QPushButton[class="info"] {{
 
                 QMessageBox.critical(self, "Error de Cámaras", error_msg)
 
-                labels = [self.lbl_left, self.lbl_top, self.lbl_manual_left, self.lbl_manual_top]
-                for lbl in labels:
-                    self.set_camera_placeholder(lbl)
-
-                self.cameras_connected = False
-                self.update_camera_dependent_buttons(False)
-
-                self.status_bar.set_camera_status(False)
-                self.status_bar.set_status(
-                    "Hardware de cámara no detectado",
-                    "error"
-                )
-
+                self._handle_camera_failure("Hardware de cámara no detectado")
                 return False
 
             fps_ms = int(1000 / Config.PREVIEW_FPS)
             self.timer.start(fps_ms)
 
             self.last_frame_time = time.time()
+            self._camera_read_failures = 0
+            self._left_signal_failures = 0
+            self._top_signal_failures = 0
+            self._auto_reconnect_attempts = 0
+            self._microcuts_left.clear()
+            self._microcuts_top.clear()
 
             self.cameras_connected = True
             self.update_camera_dependent_buttons(True)
@@ -5024,6 +6545,9 @@ QPushButton[class="info"] {{
                 "Sistema de visión activo",
                 "success"
             )
+            self._update_settings_camera_indicator(True, "Streaming activo")
+            self._set_fine_tune_enabled(True)
+            self._update_camera_health_indicators("success", "success", "Señal estable", "Señal estable")
 
             return True
 
@@ -5036,26 +6560,44 @@ QPushButton[class="info"] {{
             )
 
             logger.error(f"Error al iniciar camaras: {str(e)}")
-
-            labels = [self.lbl_left, self.lbl_top, self.lbl_manual_left, self.lbl_manual_top]
-            for lbl in labels:
-                self.set_camera_placeholder(lbl)
-
-            self.cameras_connected = False
-            self.update_camera_dependent_buttons(False)
-
-            self.status_bar.set_camera_status(False)
-            self.status_bar.set_status(
-                "Error crítico de inicialización",
-                "error"
-            )
-
+            self._handle_camera_failure("Error crítico de inicialización")
             return False
 
-    def reconnect_cameras(self):
+    def _handle_camera_failure(self, message: str) -> None:
+        """Centraliza el estado de fallo de cámara: placeholders, botones, StatusBar."""
+        if hasattr(self, 'timer') and self.timer.isActive():
+            self.timer.stop()
+
+        for cam_attr in ('cap_left', 'cap_top'):
+            cam_obj = getattr(self, cam_attr, None)
+            if cam_obj is not None:
+                try:
+                    cam_obj.release()
+                except Exception:
+                    pass
+                setattr(self, cam_attr, None)
+
+        labels = [self.lbl_left, self.lbl_top, self.lbl_manual_left, self.lbl_manual_top]
+        for lbl in labels:
+            self.set_camera_placeholder(lbl)
+
+        self._camera_read_failures = 0
+        self._left_signal_failures = 0
+        self._top_signal_failures = 0
+        self.cameras_connected = False
+        self.update_camera_dependent_buttons(False)
+        self._configure_camera_tabs(False)
+        self._set_fine_tune_enabled(False)
+        self._update_settings_camera_indicator(False, message)
+        self._update_camera_health_indicators("error", "error", "Sin conexión", "Sin conexión")
+        self.status_bar.set_camera_status(False)
+        self.status_bar.set_status(message, "error")
+
+    def reconnect_cameras(self, interactive: bool = True):
         """Libera y reconecta los puertos USB de forma segura"""
 
-        QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
+        if interactive:
+            QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
         self.status_bar.set_status("Reiniciando puertos USB...", "info")
 
         try:
@@ -5081,28 +6623,86 @@ QPushButton[class="info"] {{
             connected = self.start_cameras()
 
             if connected:
+                self._configure_camera_tabs(True)
                 self.status_bar.set_status(
                     "Cámaras conectadas correctamente.",
                     "success"
                 )
+                self._update_settings_camera_indicator(True, "Reconectadas")
+                self._update_camera_health_indicators("success", "success", "Recuperada", "Recuperada")
+                if interactive:
+                    QMessageBox.information(
+                        self,
+                        "Reconexión exitosa",
+                        "Las cámaras lateral y cenital fueron reconectadas correctamente.\nEl calibrador en vivo ya está habilitado."
+                    )
             else:
                 self.status_bar.set_status(
                     "No se pudieron conectar las cámaras.",
                     "error"
                 )
+                self._update_settings_camera_indicator(False, "Reconexión fallida")
+                self._update_camera_health_indicators("error", "error", "Falló reconexión", "Falló reconexión")
+                if interactive:
+                    QMessageBox.warning(
+                        self,
+                        "Reconexión fallida",
+                        "No se pudieron reconectar las cámaras.\nVerifique cableado USB y los índices configurados."
+                    )
+
+            return bool(connected)
 
         finally:
-            QApplication.restoreOverrideCursor()
+            if interactive:
+                QApplication.restoreOverrideCursor()
      
     def update_frames(self):
         """🚀 MOTOR ULTRA-RÁPIDO: Mantiene 60 FPS estables"""
-        if self.current_tab not in [0, 1] or not self.cap_left or not self.cap_top:
+        if self.current_tab not in [0, 1] or not self.cameras_connected or not self.cap_left or not self.cap_top:
             return
         
         # 1. Captura de frames (Thread-Safe)
         ret_l, frame_l = self.cap_left.read()
         ret_t, frame_t = self.cap_top.read()
-        if not (ret_l and ret_t): return
+
+        if ret_l:
+            self._left_signal_failures = 0
+        else:
+            self._left_signal_failures += 1
+            if self._left_signal_failures == 1:
+                self._register_microcut("left")
+
+        if ret_t:
+            self._top_signal_failures = 0
+        else:
+            self._top_signal_failures += 1
+            if self._top_signal_failures == 1:
+                self._register_microcut("top")
+
+        left_state = "success" if self._left_signal_failures == 0 else ("warning" if self._left_signal_failures < 4 else "error")
+        top_state = "success" if self._top_signal_failures == 0 else ("warning" if self._top_signal_failures < 4 else "error")
+
+        self._prune_microcuts_window()
+        left_cuts = len(self._microcuts_left)
+        top_cuts = len(self._microcuts_top)
+        left_detail = (
+            f"Señal estable · {left_cuts}/60s" if left_state == "success"
+            else (f"Intermitencia · {left_cuts}/60s" if left_state == "warning" else f"Sin lectura · {left_cuts}/60s")
+        )
+        top_detail = (
+            f"Señal estable · {top_cuts}/60s" if top_state == "success"
+            else (f"Intermitencia · {top_cuts}/60s" if top_state == "warning" else f"Sin lectura · {top_cuts}/60s")
+        )
+        self._update_camera_health_indicators(left_state, top_state, left_detail, top_detail)
+
+        if not (ret_l and ret_t):
+            self._camera_read_failures += 1
+            if self._camera_read_failures >= 6:
+                self._handle_camera_failure("Se perdió la conexión de cámaras durante la captura")
+                self._request_auto_reconnect("sin señal en stream")
+            return
+
+        self._camera_read_failures = 0
 
         # Guardamos referencia para cuentagotas (sin copiar memoria)
         self.current_frame_left = frame_l
@@ -5339,29 +6939,7 @@ QPushButton[class="info"] {{
         measurement_data = self.db.get_measurement_as_dict(measurement_id)
         if not measurement_data: return
 
-        # --- REPARACIÓN DE RUTA ABSOLUTA ---
-        raw_path = measurement_data.get('image_path', "")
-        
-        # Intentamos normalizar la ruta para Windows
-        if raw_path:
-            raw_path = os.path.abspath(raw_path)
-            
-            if not os.path.exists(raw_path):
-                filename = os.path.basename(raw_path)
-                # Buscamos directamente en las carpetas de resultados del proyecto
-                posibles = [
-                    os.path.abspath(os.path.join("Resultados", "Imagenes_Manuales", filename)),
-                    os.path.abspath(os.path.join("Resultados", "Imagenes_Automaticas", filename)),
-                    os.path.join(Config.IMAGES_MANUAL_DIR, filename)
-                ]
-                for p in posibles:
-                    if os.path.exists(p):
-                        raw_path = p
-                        print(f"✅ MainWindow encontró la imagen en: {p}")
-                        break
-        
-        # Le pasamos la ruta YA REPARADA al diccionario
-        measurement_data['image_path'] = raw_path
+        measurement_data['image_path'] = self._resolve_measurement_image_path(measurement_data) or ""
 
         # Abrir el diálogo
         dialog = EditMeasurementDialog(measurement_data, parent=self)
@@ -5373,7 +6951,7 @@ QPushButton[class="info"] {{
             else:
                 QMessageBox.critical(self, "Error", "No se pudo actualizar la BD.")
    
-    def view_measurement_image(self):
+    def view_measurement_image(self, *_):
         """
         Abre el visor. Si la ruta falla, busca el archivo por su FECHA exacta.
         """
@@ -5395,60 +6973,13 @@ QPushButton[class="info"] {{
             return
 
         # -------------------------------------------------------------
-        # 3. RECUPERACIÓN INTELIGENTE DE IMAGEN (El arreglo)
+        # 3. RECUPERACIÓN INTELIGENTE DE IMAGEN (unificada)
         # -------------------------------------------------------------
         image_path = str(m_data.get('image_path', "")).strip()
-        archivo_encontrado = None
+        archivo_encontrado = self._resolve_measurement_image_path(m_data)
 
-        # CASO A: La ruta existe y es válida
-        if image_path and os.path.exists(image_path):
-            archivo_encontrado = image_path
-        
-        # CASO B: Ruta vacía o rota -> INICIAMOS BÚSQUEDA FORENSE
-        else:
+        if not archivo_encontrado:
             self.status_bar.set_status(f"Buscando imagen perdida para ID {m_id}...", "warning")
-            
-            # Usamos el Timestamp para hallar el archivo (es la huella digital única)
-            # Formato en BD: "2026-02-11 18:30:00" -> Buscamos "20260211_183000"
-            ts_str = str(m_data.get('timestamp', ""))
-            fish_id = str(m_data.get('fish_id', ""))
-            
-            try:
-                # Limpiamos la fecha para que coincida con el nombre del archivo
-                ts_clean = ts_str.replace("-", "").replace(":", "").replace(" ", "_")
-                # Tomamos solo la parte YYYYMMDD_HHMMSS (primeros 15 caracteres)
-                # por si el string tiene milisegundos o cosas extra
-                key_search = ts_clean[:15] 
-            except:
-                key_search = "INVALIDO"
-
-            # Directorios donde buscar
-            search_dirs = [
-                Config.IMAGES_MANUAL_DIR,
-                Config.IMAGES_AUTO_DIR,
-                os.getcwd()
-            ]
-
-            if len(key_search) > 10: # Solo buscamos si la fecha parece válida
-                import glob
-                
-                for carpeta in search_dirs:
-                    if not os.path.exists(carpeta): continue
-                    
-                    # Buscamos cualquier JPG que contenga esa fecha exacta
-                    # Patrón: *20260211_183000*.jpg
-                    patron = os.path.join(carpeta, f"*{key_search}*.jpg")
-                    coincidencias = glob.glob(patron)
-                    
-                    if coincidencias:
-                        # Si encontramos uno, ¡BINGO!
-                        archivo_encontrado = coincidencias[0]
-                        # Opcional: Preferir el que tenga el mismo ID si hay varios
-                        for c in coincidencias:
-                            if fish_id in os.path.basename(c):
-                                archivo_encontrado = c
-                                break
-                        break # Dejamos de buscar
 
         # -------------------------------------------------------------
         # 4. RESULTADO FINAL
@@ -5486,6 +7017,143 @@ QPushButton[class="info"] {{
                 f"• Ruta BD: {image_path}\n"
                 f"• Fecha buscada: {m_data.get('timestamp')}\n\n"
                 "Verifique si el archivo fue eliminado manualmente de la carpeta 'Capturas'.")
+
+    def _stats_get_preferred_numeric(self, measurement_row, *field_names, default=0.0):
+        """Obtiene el primer valor numérico positivo disponible para estadísticas."""
+        for field_name in field_names:
+            try:
+                value = self.db.get_field_value(measurement_row, field_name, None)
+                if value in (None, ""):
+                    continue
+                numeric = float(value)
+                if numeric > 0:
+                    return numeric
+            except (TypeError, ValueError):
+                continue
+        return float(default)
+
+    def _stats_get_text(self, measurement_row, field_name, default=""):
+        """Obtiene un texto de forma robusta para reportes y exportaciones."""
+        value = self.db.get_field_value(measurement_row, field_name, default)
+        if value in (None, ""):
+            return default
+        return str(value)
+
+    def _stats_get_datetime(self, measurement_row):
+        """Convierte el timestamp de una medición a datetime si es válido."""
+        ts_str = self._stats_get_text(measurement_row, 'timestamp', '')
+        if not ts_str:
+            return None
+
+        try:
+            return datetime.fromisoformat(ts_str)
+        except Exception:
+            try:
+                return datetime.strptime(ts_str, "%Y-%m-%d %H:%M:%S")
+            except Exception:
+                return None
+
+    def _build_statistics_dataset(self, measurements):
+        """Construye una fuente única de datos para pantalla, PNG, PDF y CSV."""
+        dataset = {
+            'count': len(measurements),
+            'records': [],
+            'lengths': [],
+            'weights': [],
+            'heights': [],
+            'widths': [],
+            'k_factors': [],
+            'dates': [],
+            'dates_for_lengths': [],
+            'dates_for_weights': [],
+            'pairs': [],
+        }
+
+        for measurement in measurements:
+            try:
+                record = {
+                    'fish_id': self._stats_get_text(measurement, 'fish_id', '-'),
+                    'timestamp': self._stats_get_datetime(measurement),
+                    'length': self._stats_get_preferred_numeric(measurement, 'manual_length_cm', 'length_cm'),
+                    'weight': self._stats_get_preferred_numeric(measurement, 'manual_weight_g', 'weight_g'),
+                    'height': self._stats_get_preferred_numeric(measurement, 'manual_height_cm', 'height_cm'),
+                    'width': self._stats_get_preferred_numeric(measurement, 'manual_width_cm', 'width_cm'),
+                }
+            except Exception:
+                logger.debug("Registro omitido en estadísticas por datos inválidos", exc_info=True)
+                continue
+
+            dataset['records'].append(record)
+
+            if record['timestamp'] is not None:
+                dataset['dates'].append(record['timestamp'])
+
+            if record['length'] > 0:
+                dataset['lengths'].append(record['length'])
+                if record['timestamp'] is not None:
+                    dataset['dates_for_lengths'].append(record['timestamp'])
+
+            if record['weight'] > 0:
+                dataset['weights'].append(record['weight'])
+                if record['timestamp'] is not None:
+                    dataset['dates_for_weights'].append(record['timestamp'])
+
+            if record['height'] > 0:
+                dataset['heights'].append(record['height'])
+
+            if record['width'] > 0:
+                dataset['widths'].append(record['width'])
+
+            if record['length'] > 0 and record['weight'] > 0:
+                dataset['pairs'].append((record['length'], record['weight']))
+                dataset['k_factors'].append((100 * record['weight']) / (record['length'] ** 3))
+
+        return dataset
+
+    def _build_weekly_metric_map(self, records, field_name):
+        """Agrupa una métrica semanalmente para curvas de crecimiento."""
+        weekly_data = {}
+        for record in records:
+            value = float(record.get(field_name) or 0)
+            dt_value = record.get('timestamp')
+            if value <= 0 or dt_value is None:
+                continue
+
+            monday = dt_value.date() - timedelta(days=dt_value.date().weekday())
+            weekly_data.setdefault(monday, []).append(value)
+
+        return weekly_data
+
+    def _set_scaled_graph_preview(self, label, pixmap, container):
+        """Reescala el gráfico ampliado cada vez que cambia el tamaño del visor."""
+        if pixmap is None or pixmap.isNull() or label is None or container is None:
+            return
+
+        target_size = container.viewport().size()
+        if target_size.width() <= 1 or target_size.height() <= 1:
+            target_size = pixmap.size()
+
+        label.setPixmap(
+            pixmap.scaled(
+                target_size,
+                Qt.AspectRatioMode.KeepAspectRatio,
+                Qt.TransformationMode.SmoothTransformation,
+            )
+        )
+
+    def _stats_log_graph_error(self, graph_name, error):
+        """Centraliza el registro de errores al construir gráficas."""
+        logger.error("Error generando grafica '%s': %s", graph_name, error, exc_info=True)
+
+    def _apply_stats_axis_style(self, ax, title, xlabel, ylabel):
+        """Aplica un estilo consistente y legible para el panel estadístico."""
+        ax.set_title(title, fontweight='bold', pad=10)
+        ax.set_xlabel(xlabel)
+        ax.set_ylabel(ylabel)
+        ax.grid(True, linestyle=':', alpha=0.35)
+        ax.spines['top'].set_visible(False)
+        ax.spines['right'].set_visible(False)
+
     def export_statistics(self):
         """
         📊 EXPORTAR PANEL COMPLETO (6 en 1):
@@ -5499,6 +7167,15 @@ QPushButton[class="info"] {{
         if not measurements:
             QMessageBox.warning(self, "Advertencia", "No Hay Mediciones Para Exportar")
             return
+
+        stats_data = self._build_statistics_dataset(measurements)
+        lengths = stats_data['lengths']
+        weights = stats_data['weights']
+        heights = stats_data['heights']
+        widths = stats_data['widths']
+        k_factors = stats_data['k_factors']
+        records = stats_data['records']
+        pairs = stats_data['pairs']
         
         try:
             # Configurar Estilo "Reporte Científico" (Fondo Blanco)
@@ -5508,34 +7185,6 @@ QPushButton[class="info"] {{
             # Directorio
             output_dir = os.path.join(Config.OUT_DIR, "Graficos")
             os.makedirs(output_dir, exist_ok=True)
-            
-            # --- HELPERS DE EXTRACCIÓN ---
-            col_map = {col: i for i, col in enumerate(MEASUREMENT_COLUMNS)}
-            
-            def get_val(row, col_name):
-                idx = col_map.get(col_name)
-                if idx is not None and idx < len(row):
-                    try: return float(row[idx] or 0)
-                    except: pass
-                return 0.0
-
-            def get_date(row):
-                idx = col_map.get('timestamp')
-                if idx is not None and idx < len(row):
-                    try: return datetime.fromisoformat(str(row[idx]))
-                    except: pass
-                return None
-
-            # Extracción de Listas
-            lengths = [get_val(m, 'length_cm') for m in measurements if get_val(m, 'length_cm') > 0]
-            weights = [get_val(m, 'weight_g') for m in measurements if get_val(m, 'weight_g') > 0]
-            
-            heights, widths = [], []
-            for m in measurements:
-                h = get_val(m, 'manual_height_cm') or get_val(m, 'height_cm')
-                w_val = get_val(m, 'manual_width_cm') or get_val(m, 'width_cm')
-                if h > 0: heights.append(h)
-                if w_val > 0: widths.append(w_val)
 
             # --- LIENZO 3x2 ---
             fig = plt.figure(figsize=(16, 10), constrained_layout=True, dpi=200)
@@ -5564,12 +7213,9 @@ QPushButton[class="info"] {{
 
             # 3. RELACIÓN L/P (Scatter)
             ax3 = fig.add_subplot(gs[1, 0])
-            l_scat, w_scat = [], []
-            for m in measurements:
-                l, w = get_val(m, 'length_cm'), get_val(m, 'weight_g')
-                if l > 0 and w > 0: l_scat.append(l); w_scat.append(w)
-            
-            if l_scat:
+            if pairs:
+                l_scat = [pair[0] for pair in pairs]
+                w_scat = [pair[1] for pair in pairs]
                 ax3.scatter(l_scat, w_scat, alpha=0.5, color='#e74c3c', edgecolors='black')
             ax3.set_title('Relación Longitud vs Peso', fontweight='bold')
             ax3.set_xlabel('Longitud (cm)'); ax3.set_ylabel('Peso (g)')
@@ -5580,9 +7226,9 @@ QPushButton[class="info"] {{
             
             # Agrupar por Semana (Peso)
             weekly_data = {}
-            for m in measurements:
-                w = get_val(m, 'weight_g')
-                dt = get_date(m)
+            for record in records:
+                w = float(record.get('weight') or 0)
+                dt = record.get('timestamp')
                 if w > 0 and dt:
                     monday = dt.date() - timedelta(days=dt.date().weekday())
                     weekly_data[monday] = weekly_data.get(monday, []) + [w]
@@ -5616,7 +7262,8 @@ QPushButton[class="info"] {{
                             if cand[-1] < mx * 4: # Sanity check
                                 y_trend = cand
                                 lbl = "Tendencia (Gompertz)"
-                    except: pass
+                    except Exception as error:
+                        logger.debug("Gompertz descartado en export_statistics: %s", error)
 
                     # Fallback Lineal
                     if y_trend is None:
@@ -5663,8 +7310,10 @@ QPushButton[class="info"] {{
             QMessageBox.information(self, "Éxito", f"Reporte generado:\n{save_path}")
             
             # Abrir carpeta automáticamente
-            try: os.startfile(output_dir)
-            except: pass
+            try:
+                os.startfile(output_dir)
+            except Exception as error:
+                logger.debug("No se pudo abrir la carpeta de gráficos automáticamente: %s", error)
 
         except Exception as e:
             QMessageBox.critical(self, "Error", f"Error generando reporte:\n{e}")
@@ -5723,23 +7372,11 @@ QPushButton[class="info"] {{
                 
                 for row in rows:
                     # Variables para cálculo de K
-                    l_val = 0.0
-                    w_val = 0.0
+                    l_val = self._stats_get_preferred_numeric(row, 'manual_length_cm', 'length_cm')
+                    w_val = self._stats_get_preferred_numeric(row, 'manual_weight_g', 'weight_g')
                     cleaned_row = []
 
                     for col_name, val in zip(db_column_names, row):
-                        # Guardar valores para cálculo de Factor K
-                        if col_name == 'length_cm' and val:
-                            try: 
-                                l_val = float(val)
-                            except: 
-                                pass
-                        elif col_name == 'weight_g' and val:
-                            try: 
-                                w_val = float(val)
-                            except: 
-                                pass
-                        
                         # Limpieza y formato
                         if val is None:
                             cleaned_row.append("")
@@ -5803,43 +7440,19 @@ QPushButton[class="info"] {{
             QMessageBox.warning(self, "Sin Datos", "No hay registros para generar el informe.")
             return
 
+        stats_data = self._build_statistics_dataset(measurements)
+        lengths = stats_data['lengths']
+        weights = stats_data['weights']
+        heights = stats_data['heights']
+        widths = stats_data['widths']
+        k_factors = stats_data['k_factors']
+        records = stats_data['records']
+
         # Directorio temporal para imágenes del PDF
         temp_plots_dir = os.path.join(report_dir, "_temp_pdf_plots")
         os.makedirs(temp_plots_dir, exist_ok=True)
 
         try:
-            # --- HELPERS DE EXTRACCIÓN ---
-            col_map = {col: i for i, col in enumerate(MEASUREMENT_COLUMNS)}
-            
-            def get_val(row, col_name):
-                idx = col_map.get(col_name)
-                if idx is not None and idx < len(row):
-                    try: return float(row[idx] or 0)
-                    except: pass
-                return 0.0
-
-            def get_str(row, col_name):
-                idx = col_map.get(col_name)
-                if idx is not None and idx < len(row): return str(row[idx] or "")
-                return ""
-
-            def get_date(row):
-                idx = col_map.get('timestamp')
-                if idx is not None and idx < len(row):
-                    try: return datetime.fromisoformat(str(row[idx]))
-                    except: pass
-                return None
-
-            # Extracción
-            lengths = [get_val(m, 'length_cm') for m in measurements if get_val(m, 'length_cm') > 0]
-            weights = [get_val(m, 'weight_g') for m in measurements if get_val(m, 'weight_g') > 0]
-            heights, widths = [], []
-            for m in measurements:
-                h = get_val(m, 'manual_height_cm') or get_val(m, 'height_cm')
-                w = get_val(m, 'manual_width_cm') or get_val(m, 'width_cm')
-                if h > 0: heights.append(h)
-                if w > 0: widths.append(w)
-
             # --- CONFIGURACIÓN PDF ---
             doc = SimpleDocTemplate(path, pagesize=A4, rightMargin=40, leftMargin=40, topMargin=40, bottomMargin=40)
             styles = getSampleStyleSheet()
@@ -5864,6 +7477,8 @@ QPushButton[class="info"] {{
             t_data.append(calc_row("Longitud", lengths, "cm"))
             t_data.append(calc_row("Peso", weights, "g"))
             t_data.append(calc_row("Altura", heights, "cm"))
+            t_data.append(calc_row("Ancho", widths, "cm"))
+            t_data.append(calc_row("Factor K", k_factors, ""))
             
             t = Table(t_data, colWidths=[100, 60, 100, 100, 100])
             t.setStyle(TableStyle([
@@ -5877,106 +7492,281 @@ QPushButton[class="info"] {{
             elements.append(Spacer(1, 20))
 
             # --- 2. GRÁFICOS CIENTÍFICOS ---
-            elements.append(Paragraph("2. Análisis de Crecimiento", h2_style))
-            
-            # Config Matplotlib
+            elements.append(Paragraph("2. Galería Analítica Extendida", h2_style))
+
             plt.style.use('default')
             plt.rcParams.update({'font.size': 9})
 
-            # A. HISTOGRAMAS LADO A LADO
-            fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(8, 3.5), dpi=200)
-            if lengths:
-                ax1.hist(lengths, bins=15, color='#3498db', alpha=0.7, edgecolor='black')
-                ax1.set_title("Longitudes"); ax1.set_xlabel("cm")
-            if weights:
-                ax2.hist(weights, bins=15, color='#2ecc71', alpha=0.7, edgecolor='black')
-                ax2.set_title("Pesos"); ax2.set_xlabel("g")
-            
-            dist_path = os.path.join(temp_plots_dir, "dist.png")
-            plt.savefig(dist_path, bbox_inches='tight')
-            plt.close(fig)
-            elements.append(Image(dist_path, width=450, height=200))
-            elements.append(Spacer(1, 10))
+            rendered_graphs = 0
 
-            # B. CURVA DE CRECIMIENTO INTELIGENTE (GOMPERTZ)
-            fig, ax = plt.subplots(figsize=(8, 4), dpi=200)
-            
-            # Agrupar datos semanales
-            weekly_w = {}
-            for m in measurements:
-                w = get_val(m, 'weight_g')
-                dt = get_date(m)
-                if w > 0 and dt:
-                    monday = dt.date() - timedelta(days=dt.date().weekday())
-                    weekly_w[monday] = weekly_w.get(monday, []) + [w]
+            def save_plot(fig, file_name):
+                file_path = os.path.join(temp_plots_dir, file_name)
+                fig.tight_layout()
+                fig.savefig(file_path, bbox_inches='tight', dpi=220)
+                plt.close(fig)
+                return file_path
 
-            if weekly_w:
-                sorted_d = sorted(weekly_w.keys())
-                dts = [datetime.combine(d, datetime.min.time()) for d in sorted_d]
-                avgs = np.array([sum(weekly_w[d])/len(weekly_w[d]) for d in sorted_d])
-                
-                ax.plot(dts, avgs, 'o', color='#8e44ad', label='Promedio Semanal')
+            def append_graph(caption, fig, file_name, width=460, height=220):
+                nonlocal rendered_graphs
+                image_path = save_plot(fig, file_name)
+                elements.append(Paragraph(caption, subtitle_style))
+                elements.append(Image(image_path, width=width, height=height))
+                elements.append(Spacer(1, 8))
+                rendered_graphs += 1
+                if rendered_graphs % 3 == 0:
+                    elements.append(PageBreak())
 
-                # MATEMÁTICA
-                if len(avgs) >= 2:
-                    start = dts[0]
-                    days_rel = np.array([(d - start).days for d in dts])
-                    last = days_rel[-1]
-                    fut = np.linspace(0, last + 45, 100)
-                    y_trend = None
-                    lbl = ""
+            def build_weekly_map(field_name):
+                return self._build_weekly_metric_map(records, field_name)
 
-                    try: # Gompertz
-                        if len(avgs) >= 3:
-                            def gompertz(t, A, B, k): return A * np.exp(-np.exp(B - k*t))
-                            mx = max(avgs)
-                            p0 = [mx*1.5, 1.0, 0.02]
-                            bounds = ([mx, -10, 0], [np.inf, 10, 1.0])
-                            popt, _ = curve_fit(gompertz, days_rel, avgs, p0=p0, bounds=bounds, maxfev=5000)
-                            cand = gompertz(fut, *popt)
-                            if cand[-1] < mx * 4:
-                                y_trend = cand
-                                lbl = "Modelo Gompertz"
-                    except: pass
+            def plot_weekly_trend(ax, weekly_data, color_line, label, unit):
+                sorted_weeks = sorted(weekly_data.keys())
+                if not sorted_weeks:
+                    return
 
-                    if y_trend is None: # Lineal
-                        z = np.polyfit(days_rel, avgs, 1)
-                        y_trend = np.poly1d(z)(fut)
-                        lbl = "Tendencia Lineal"
+                sorted_dts = [datetime.combine(d, datetime.min.time()) for d in sorted_weeks]
+                avg_vals = np.array([sum(weekly_data[d]) / len(weekly_data[d]) for d in sorted_weeks])
+                start_date = sorted_dts[0]
+                days_since_start = np.array([(d - start_date).days for d in sorted_dts])
 
-                    fut_dates = [start + timedelta(days=x) for x in fut]
-                    ax.plot(fut_dates, y_trend, '--', color='#2c3e50', linewidth=2, label=lbl)
-                    
-                    final = y_trend[-1]
-                    if final < 100000:
-                        ax.text(fut_dates[-1], final, f"{final:.1f}g", fontweight='bold')
+                ax.plot(sorted_dts, avg_vals, 'o', color=color_line, markersize=6, label=f'{label} semanal')
 
-                ax.set_title("Proyección de Crecimiento (Biomasa)")
-                ax.set_ylabel("Peso (g)")
+                if len(avg_vals) >= 2:
+                    future_days = np.linspace(0, days_since_start[-1] + 45, 100)
+                    trend_values = None
+                    trend_label = ""
+
+                    try:
+                        if len(avg_vals) >= 3:
+                            def gompertz(t, A, B, k):
+                                return A * np.exp(-np.exp(B - k * t))
+
+                            max_val = max(avg_vals)
+                            p0 = [max_val * 1.5, 1.0, 0.02]
+                            bounds = ([max_val, -10, 0], [np.inf, 10, 1.0])
+                            params, _ = curve_fit(gompertz, days_since_start, avg_vals, p0=p0, bounds=bounds, maxfev=5000)
+                            candidate = gompertz(future_days, *params)
+                            if candidate[-1] < max_val * 3:
+                                trend_values = candidate
+                                trend_label = "Tendencia Gompertz"
+                    except Exception as error:
+                        logger.debug("Gompertz descartado en PDF para %s: %s", label, error)
+
+                    if trend_values is None:
+                        coeffs = np.polyfit(days_since_start, avg_vals, 1)
+                        trend_values = np.poly1d(coeffs)(future_days)
+                        trend_label = "Tendencia lineal"
+
+                    future_dates = [start_date + timedelta(days=float(d)) for d in future_days]
+                    ax.plot(future_dates, trend_values, '--', color='#2c3e50', linewidth=1.8, label=trend_label)
+
+                ax.set_title(f"Evolución de {label}")
+                ax.set_xlabel("Semana")
+                ax.set_ylabel(f"{label} ({unit})")
                 ax.xaxis.set_major_formatter(mdates.DateFormatter('%d/%b'))
+                ax.grid(True, linestyle=':', alpha=0.4)
                 ax.legend()
-                ax.grid(True, linestyle=':', alpha=0.5)
 
-            evo_path = os.path.join(temp_plots_dir, "evo.png")
-            plt.savefig(evo_path, bbox_inches='tight')
-            plt.close(fig)
-            elements.append(Image(evo_path, width=450, height=225))
-            elements.append(PageBreak())
+            # 2.1 Histograma longitudinal y biomasa
+            fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(8.5, 3.8))
+            if lengths:
+                ax1.hist(lengths, bins=15, color='#3498db', alpha=0.75, edgecolor='black')
+                ax1.axvline(np.mean(lengths), color='#1f3a5f', linestyle='--', linewidth=1.4)
+            ax1.set_title("Distribución de Tallas")
+            ax1.set_xlabel("Longitud (cm)")
+            ax1.set_ylabel("Frecuencia")
+
+            if weights:
+                ax2.hist(weights, bins=15, color='#2ecc71', alpha=0.75, edgecolor='black')
+                ax2.axvline(np.mean(weights), color='#145a32', linestyle='--', linewidth=1.4)
+            ax2.set_title("Distribución de Pesos")
+            ax2.set_xlabel("Peso (g)")
+            ax2.set_ylabel("Frecuencia")
+            append_graph("2.1 Distribuciones base (talla y peso)", fig, "pdf_01_distribuciones.png", width=470, height=215)
+
+            # 2.2 Morfometría (altura y ancho)
+            if heights or widths:
+                fig, ax = plt.subplots(figsize=(8.5, 3.8))
+                if heights:
+                    ax.hist(heights, bins=10, color='#3498db', alpha=0.45, edgecolor='black', label='Altura')
+                if widths:
+                    ax.hist(widths, bins=10, color='#f39c12', alpha=0.45, edgecolor='black', label='Ancho')
+                ax.set_title("Morfometría combinada")
+                ax.set_xlabel("Medida (cm)")
+                ax.set_ylabel("Frecuencia")
+                ax.legend()
+                append_graph("2.2 Distribución morfométrica (altura y ancho)", fig, "pdf_02_morfometria.png", width=470, height=215)
+
+            # 2.3 Crecimiento de peso
+            weekly_weights = build_weekly_map('weight')
+            if weekly_weights:
+                fig, ax = plt.subplots(figsize=(8.5, 3.9))
+                plot_weekly_trend(ax, weekly_weights, '#9b59b6', 'Peso', 'g')
+                fig.autofmt_xdate(rotation=35, ha='right')
+                append_graph("2.3 Proyección de crecimiento en peso", fig, "pdf_03_peso.png", width=470, height=220)
+
+            # 2.4 Crecimiento de longitud
+            weekly_lengths = build_weekly_map('length')
+            if weekly_lengths:
+                fig, ax = plt.subplots(figsize=(8.5, 3.9))
+                plot_weekly_trend(ax, weekly_lengths, '#e67e22', 'Longitud', 'cm')
+                fig.autofmt_xdate(rotation=35, ha='right')
+                append_graph("2.4 Proyección de crecimiento en longitud", fig, "pdf_04_longitud.png", width=470, height=220)
+
+            # 2.5 Relación longitud/peso
+            if stats_data['pairs']:
+                fig, ax = plt.subplots(figsize=(8.5, 3.9))
+                paired_lengths = [pair[0] for pair in stats_data['pairs']]
+                paired_weights = [pair[1] for pair in stats_data['pairs']]
+                ax.scatter(paired_lengths, paired_weights, c='#e74c3c', alpha=0.62, edgecolors='black', linewidths=0.4)
+                ax.set_title("Relación Longitud / Peso")
+                ax.set_xlabel("Longitud (cm)")
+                ax.set_ylabel("Peso (g)")
+                ax.grid(True, linestyle=':', alpha=0.35)
+                append_graph("2.5 Correlación biométrica longitud-peso", fig, "pdf_05_correlacion.png", width=470, height=220)
+
+            # 2.6 Factor K
+            if k_factors:
+                fig, ax = plt.subplots(figsize=(8.5, 3.9))
+                ax.hist(k_factors, bins=12, color='#16a085', alpha=0.78, edgecolor='black')
+                ax.axvspan(1.0, 1.4, color='#2ecc71', alpha=0.14, label='Zona óptima')
+                ax.axvline(np.mean(k_factors), color='#0b5345', linestyle='--', linewidth=1.5, label=f"Prom: {np.mean(k_factors):.3f}")
+                ax.set_title("Distribución del Factor K")
+                ax.set_xlabel("Factor de condición K")
+                ax.set_ylabel("Frecuencia")
+                ax.legend()
+                ax.grid(True, linestyle=':', alpha=0.35)
+                append_graph("2.6 Estado corporal del lote (factor K)", fig, "pdf_06_factor_k.png", width=470, height=220)
+
+            # 2.7 Perfil corporal (ancho vs altura)
+            body_records = [record for record in records if record.get('height', 0) > 0 and record.get('width', 0) > 0]
+            if body_records:
+                fig, ax = plt.subplots(figsize=(8.5, 3.9))
+                body_widths = [record['width'] for record in body_records]
+                body_heights = [record['height'] for record in body_records]
+                ax.scatter(body_widths, body_heights, c='#af7ac5', alpha=0.66, edgecolors='black', linewidths=0.4)
+                if len(body_widths) >= 2:
+                    coeffs = np.polyfit(body_widths, body_heights, 1)
+                    trend_x = np.linspace(min(body_widths), max(body_widths), 60)
+                    trend_y = np.poly1d(coeffs)(trend_x)
+                    ax.plot(trend_x, trend_y, '--', color='#5b2c6f', linewidth=1.5, label='Tendencia')
+                    ax.legend()
+                ax.set_title("Perfil corporal")
+                ax.set_xlabel("Ancho dorsal (cm)")
+                ax.set_ylabel("Altura corporal (cm)")
+                ax.grid(True, linestyle=':', alpha=0.35)
+                append_graph("2.7 Perfil corporal (ancho vs altura)", fig, "pdf_07_perfil.png", width=470, height=220)
+
+            # 2.8 Variabilidad biométrica
+            metric_map = {
+                'Longitud': lengths,
+                'Peso': weights,
+                'Altura': heights,
+                'Ancho': widths,
+            }
+            labels = []
+            cv_values = []
+            for metric_name, metric_values in metric_map.items():
+                if len(metric_values) >= 2 and np.mean(metric_values) > 0:
+                    labels.append(metric_name)
+                    cv_values.append((np.std(metric_values) / np.mean(metric_values)) * 100)
+
+            if labels:
+                fig, ax = plt.subplots(figsize=(8.5, 3.9))
+                bars = ax.bar(labels, cv_values, color=['#3498db', '#2ecc71', '#1abc9c', '#f1c40f'][:len(labels)], edgecolor='black', alpha=0.85)
+                for bar, value in zip(bars, cv_values):
+                    ax.text(bar.get_x() + bar.get_width() / 2, value + 0.35, f"{value:.1f}%", ha='center', va='bottom', fontsize=8.5, fontweight='bold')
+                ax.set_title("Variabilidad del lote (CV%)")
+                ax.set_xlabel("Indicador")
+                ax.set_ylabel("Coeficiente de variación (%)")
+                ax.grid(True, axis='y', linestyle=':', alpha=0.35)
+                append_graph("2.8 Variabilidad por indicador biométrico", fig, "pdf_08_variabilidad.png", width=470, height=220)
+
+            # 2.9 Intensidad de muestreo semanal
+            weekly_counts = build_weekly_map('length')
+            if weekly_counts:
+                fig, ax = plt.subplots(figsize=(8.5, 3.9))
+                weeks = sorted(weekly_counts.keys())
+                week_dates = [datetime.combine(week, datetime.min.time()) for week in weeks]
+                counts = [len(weekly_counts[week]) for week in weeks]
+                ax.bar(week_dates, counts, color='#5dade2', edgecolor='#1b4f72', width=5)
+                ax.set_title("Intensidad de muestreo semanal")
+                ax.set_xlabel("Semana")
+                ax.set_ylabel("Número de mediciones")
+                ax.xaxis.set_major_formatter(mdates.DateFormatter('%d/%b'))
+                ax.grid(True, axis='y', linestyle=':', alpha=0.35)
+                fig.autofmt_xdate(rotation=35, ha='right')
+                append_graph("2.9 Cobertura de muestreo por semana", fig, "pdf_09_muestreo.png", width=470, height=220)
+
+            # 2.10 Clases de talla
+            if lengths:
+                fig, ax = plt.subplots(figsize=(8.5, 3.9))
+                class_bins = min(7, max(4, int(np.sqrt(len(lengths)))))
+                counts, bins = np.histogram(lengths, bins=class_bins)
+                class_labels = [f"{bins[i]:.1f}-{bins[i + 1]:.1f}" for i in range(len(counts))]
+                bars = ax.bar(class_labels, counts, color='#2471a3', alpha=0.86, edgecolor='black')
+                for bar, value in zip(bars, counts):
+                    ax.text(bar.get_x() + bar.get_width() / 2, value + 0.2, str(int(value)), ha='center', va='bottom', fontsize=8.5, fontweight='bold')
+                ax.set_title("Clases de talla")
+                ax.set_xlabel("Rango de longitud (cm)")
+                ax.set_ylabel("Cantidad")
+                ax.tick_params(axis='x', rotation=24)
+                ax.grid(True, axis='y', linestyle=':', alpha=0.35)
+                append_graph("2.10 Segmentación del lote por clases de talla", fig, "pdf_10_clases_talla.png", width=470, height=220)
+
+            # 2.11 Tendencia semanal del factor K
+            weekly_k = {}
+            for record in records:
+                length_value = float(record.get('length') or 0)
+                weight_value = float(record.get('weight') or 0)
+                ts_value = record.get('timestamp')
+                if length_value <= 0 or weight_value <= 0 or ts_value is None:
+                    continue
+                k_value = (100 * weight_value) / (length_value ** 3)
+                monday = ts_value.date() - timedelta(days=ts_value.date().weekday())
+                weekly_k.setdefault(monday, []).append(k_value)
+
+            if weekly_k:
+                fig, ax = plt.subplots(figsize=(8.5, 3.9))
+                weeks = sorted(weekly_k.keys())
+                week_dates = [datetime.combine(week, datetime.min.time()) for week in weeks]
+                avg_k = [float(np.mean(weekly_k[week])) for week in weeks]
+                ax.plot(week_dates, avg_k, 'o-', color='#117864', linewidth=2, markersize=5.5, label='K semanal')
+                ax.axhspan(1.0, 1.4, color='#2ecc71', alpha=0.12, label='Zona óptima')
+                ax.set_title("Tendencia semanal del Factor K")
+                ax.set_xlabel("Semana")
+                ax.set_ylabel("Factor K")
+                ax.xaxis.set_major_formatter(mdates.DateFormatter('%d/%b'))
+                ax.grid(True, linestyle=':', alpha=0.35)
+                ax.legend()
+                fig.autofmt_xdate(rotation=35, ha='right')
+                append_graph("2.11 Evolución semanal del estado corporal", fig, "pdf_11_tendencia_k.png", width=470, height=220)
+
+            if rendered_graphs == 0:
+                elements.append(Paragraph("No se encontraron datos suficientes para construir gráficas en el informe.", styles['Normal']))
+
+            if rendered_graphs % 3 != 0:
+                elements.append(PageBreak())
 
             # --- 3. REGISTRO DE DATOS ---
             elements.append(Paragraph("3. Últimos Registros (Muestra)", h2_style))
             
             data_rows = [['ID', 'Fecha', 'Largo', 'Peso', 'Ancho']]
-            sorted_m = sorted(measurements, key=lambda x: get_str(x, 'timestamp'), reverse=True)[:40]
+            sorted_records = sorted(
+                records,
+                key=lambda record: record.get('timestamp') or datetime.min,
+                reverse=True,
+            )[:40]
 
-            for m in sorted_m:
-                ts = get_str(m, 'timestamp').split("T")[0]
+            for record in sorted_records:
+                ts_value = record.get('timestamp')
+                ts = ts_value.strftime('%Y-%m-%d') if ts_value else '-'
                 data_rows.append([
-                    str(get_val(m, 'fish_id')),
+                    str(record.get('fish_id') or '-'),
                     ts,
-                    f"{get_val(m, 'length_cm'):.2f}",
-                    f"{get_val(m, 'weight_g'):.2f}",
-                    f"{get_val(m, 'width_cm'):.2f}"
+                    f"{float(record.get('length') or 0):.2f}",
+                    f"{float(record.get('weight') or 0):.2f}",
+                    f"{float(record.get('width') or 0):.2f}"
                 ])
 
             t_rec = Table(data_rows, colWidths=[60, 90, 80, 80, 80])
@@ -5993,15 +7783,19 @@ QPushButton[class="info"] {{
             doc.build(elements)
             
             # Limpieza
-            try: shutil.rmtree(temp_plots_dir)
-            except: pass
+            try:
+                shutil.rmtree(temp_plots_dir)
+            except Exception as error:
+                logger.debug("No se pudo limpiar carpeta temporal PDF: %s", error)
 
             QMessageBox.information(self, "Éxito", f"Informe PDF generado:\n{path}")
 
         except Exception as e:
             QMessageBox.critical(self, "Error", f"Error PDF:\n{e}")
-            try: shutil.rmtree(temp_plots_dir)
-            except: pass  
+            try:
+                shutil.rmtree(temp_plots_dir)
+            except Exception as error:
+                logger.debug("No se pudo limpiar carpeta temporal PDF tras error: %s", error)
             
     def generate_statistics(self):
         """
@@ -6019,56 +7813,18 @@ QPushButton[class="info"] {{
                 self.stats_text.setHtml("<h3 style='color:#e74c3c; text-align:center;'>⚠️ No hay registros para analizar.</h3>")
             return
 
-        lengths, weights, dates = [], [], []
-        dates_lengths = [] 
-        dates_weights = []
-        
-        for m in measurements:
-            try:
-                
-                l_auto = float(self.db.get_field_value(m, 'length_cm', 0) or 0)
-                l_man = float(self.db.get_field_value(m, 'manual_length_cm', 0) or 0)
-                l = l_man if l_man > 0 else l_auto
+        self.current_stats_data = self._build_statistics_dataset(measurements)
 
-                w_auto = float(self.db.get_field_value(m, 'weight_g', 0) or 0)
-                w_man = float(self.db.get_field_value(m, 'manual_weight_g', 0) or 0)
-                w = w_man if w_man > 0 else w_auto
-
-                ts_str = self.db.get_field_value(m, 'timestamp', "")
-                
-                dt_obj = None
-                if ts_str:
-                    try:
-                        dt_obj = datetime.fromisoformat(str(ts_str))
-                    except:
-                        try:
-                            dt_obj = datetime.strptime(str(ts_str), "%Y-%m-%d %H:%M:%S")
-                        except: pass
-
-                if l > 0 and dt_obj:
-                    lengths.append(l)
-                    dates_lengths.append(dt_obj)
-                
-                if w > 0 and dt_obj:
-                    weights.append(w)
-                    dates_weights.append(dt_obj) 
-                    dates.append(dt_obj) 
-
-            except Exception as e:
-                continue 
-
-        self.current_stats_data = {
-            'count': len(measurements),
-            'lengths': lengths,
-            'weights': weights,
-            'dates': dates,
-            
-            'dates_for_lengths': dates_lengths,
-            'dates_for_weights': dates_weights,
-            
-            'heights': [l*0.3 for l in lengths], 
-            'widths': [l*0.15 for l in lengths]   
-        }
+        if not any([
+            self.current_stats_data['lengths'],
+            self.current_stats_data['weights'],
+            self.current_stats_data['heights'],
+            self.current_stats_data['widths'],
+        ]):
+            self.stats_text.setHtml("<h3 style='text-align:center;'>No hay mediciones válidas para construir estadísticas confiables.</h3>")
+            if hasattr(self, 'status_bar'):
+                self.status_bar.set_status("No hay mediciones válidas para estadísticas", "warning")
+            return
 
         self.update_report_html() 
         self.generate_graphs()
@@ -6082,6 +7838,12 @@ QPushButton[class="info"] {{
 
         d = self.current_stats_data
         style = self.report_style
+
+        def summary_value(values, pattern, transform=None):
+            if not values:
+                return "-"
+            raw_value = transform(values) if transform else values
+            return pattern.format(raw_value)
 
         html = f"""
             <style>
@@ -6146,14 +7908,21 @@ QPushButton[class="info"] {{
                 <tr class="section">
                     <td colspan="2">📏 Biometría Longitudinal (cm)</td>
                 </tr>
-                <tr><td>Promedio de Talla</td><td class='val'>{np.mean(d['lengths']):.2f} cm</td></tr>
-                <tr><td>Desviación Estándar</td><td class='val'>±{np.std(d['lengths']):.2f}</td></tr>
+                <tr><td>Promedio de Talla</td><td class='val'>{summary_value(d['lengths'], '{:.2f} cm', np.mean)}</td></tr>
+                <tr><td>Desviación Estándar</td><td class='val'>{summary_value(d['lengths'], '±{:.2f}', np.std)}</td></tr>
                 
                 <tr class="section">
                     <td colspan="2">⚖️ Análisis de Masa (g)</td>
                 </tr>
-                <tr><td>Peso Promedio</td><td class='val'>{np.mean(d['weights']):.2f} g</td></tr>
-                <tr><td>Biomasa Total Estimada</td><td class='val'>{np.sum(d['weights'])/1000:.2f} kg</td></tr>
+                <tr><td>Peso Promedio</td><td class='val'>{summary_value(d['weights'], '{:.2f} g', np.mean)}</td></tr>
+                <tr><td>Biomasa Total Estimada</td><td class='val'>{summary_value(d['weights'], '{:.2f} kg', lambda values: np.sum(values) / 1000)}</td></tr>
+                
+                <tr class="section">
+                    <td colspan="2">🧬 Morfometría Complementaria</td>
+                </tr>
+                <tr><td>Altura Promedio</td><td class='val'>{summary_value(d['heights'], '{:.2f} cm', np.mean)}</td></tr>
+                <tr><td>Ancho Promedio</td><td class='val'>{summary_value(d['widths'], '{:.2f} cm', np.mean)}</td></tr>
+                <tr><td>Factor K Promedio</td><td class='val'>{summary_value(d['k_factors'], '{:.3f}', np.mean)}</td></tr>
             </table>
         </div>
         """
@@ -6168,7 +7937,7 @@ QPushButton[class="info"] {{
         """
 
         data = getattr(self, 'current_stats_data', None)
-        if not data or not data['lengths']:
+        if not data or not data['records']:
             return
 
         plt.style.use('seaborn-v0_8-whitegrid')
@@ -6209,7 +7978,8 @@ QPushButton[class="info"] {{
         # ----------------------------------------------------------------------
         def plot_bio_trend(ax, date_dict, color_line, label, unit):
             sorted_weeks = sorted(date_dict.keys())
-            if not sorted_weeks: return
+            if not sorted_weeks:
+                return
             
             sorted_dts = [datetime.combine(d, datetime.min.time()) for d in sorted_weeks]
             avg_vals = np.array([sum(date_dict[d])/len(date_dict[d]) for d in sorted_weeks])
@@ -6253,8 +8023,8 @@ QPushButton[class="info"] {{
                 else:
                     raise ValueError("Pocos datos para Gompertz")
 
-            except Exception as e:
-                # print(f"Fallo Gompertz ({e}), activando Plan B...")
+            except Exception as error:
+                logger.debug("Gompertz descartado en galería para %s: %s", label, error)
                 y_trend = None # Forzar fallback
 
             # --- INTENTO 2: PLAN B (LINEAL) ---
@@ -6266,7 +8036,8 @@ QPushButton[class="info"] {{
                         poly_eq = np.poly1d(coeffs)
                         y_trend = poly_eq(future_days)
                         model_used = "Lineal (Plan B)"
-                except: pass
+                except Exception as error:
+                    logger.debug("Fallback lineal falló para %s: %s", label, error)
 
             # --- DIBUJAR ---
             if y_trend is not None:
@@ -6286,6 +8057,7 @@ QPushButton[class="info"] {{
             # Estética Eje X
             ax.xaxis.set_major_locator(mdates.WeekdayLocator(interval=1))
             ax.xaxis.set_major_formatter(mdates.DateFormatter('%d/%b'))
+            self._apply_stats_axis_style(ax, ax.get_title(), ax.get_xlabel(), ax.get_ylabel())
             ax.grid(True, axis='x', linestyle=':', alpha=0.5)
 
         # ----------------------------------------------------------------------
@@ -6296,61 +8068,215 @@ QPushButton[class="info"] {{
         try:
             fig, ax = plt.subplots(figsize=(8, 5))
             ax.hist(data['lengths'], bins=10, color='#3498db', alpha=0.7, edgecolor='black')
-            ax.set_title("Distribución de Tallas", fontweight='bold')
-            ax.set_xlabel("Longitud (cm)"); ax.set_ylabel("Frecuencia")
-            self._add_to_gallery("📏 Distribución Tallas", fig_to_pixmap(fig))
-        except: pass
+            if data['lengths']:
+                ax.axvline(np.mean(data['lengths']), color='#1f3a5f', linestyle='--', linewidth=1.5, label=f"Prom: {np.mean(data['lengths']):.2f} cm")
+                ax.legend()
+            self._apply_stats_axis_style(ax, "Distribución de Tallas", "Longitud (cm)", "Frecuencia")
+            self._add_to_gallery("📏 Distribución Tallas", fig_to_pixmap(fig), "length")
+        except Exception as error:
+            self._stats_log_graph_error("Distribución Tallas", error)
 
         # Pesos
         try:
             if data['weights']:
                 fig, ax = plt.subplots(figsize=(8, 5))
                 ax.hist(data['weights'], bins=10, color='#2ecc71', alpha=0.7, edgecolor='black')
-                ax.set_title("Distribución de Biomasa", fontweight='bold')
-                ax.set_xlabel("Peso (g)"); ax.set_ylabel("Frecuencia")
-                self._add_to_gallery("⚖️ Distribución Peso", fig_to_pixmap(fig))
-        except: pass
+                ax.axvline(np.mean(data['weights']), color='#145a32', linestyle='--', linewidth=1.5, label=f"Prom: {np.mean(data['weights']):.2f} g")
+                ax.legend()
+                self._apply_stats_axis_style(ax, "Distribución de Biomasa", "Peso (g)", "Frecuencia")
+                self._add_to_gallery("⚖️ Distribución Peso", fig_to_pixmap(fig), "weight")
+        except Exception as error:
+            self._stats_log_graph_error("Distribución Peso", error)
+
+        # Morfometría combinada (altura y ancho)
+        try:
+            if data['heights'] or data['widths']:
+                fig, ax = plt.subplots(figsize=(8.8, 4.8))
+                has_any = False
+                if data['heights']:
+                    ax.hist(data['heights'], bins=10, color='#3498db', alpha=0.45, edgecolor='black', label='Altura')
+                    has_any = True
+                if data['widths']:
+                    ax.hist(data['widths'], bins=10, color='#f39c12', alpha=0.45, edgecolor='black', label='Ancho')
+                    has_any = True
+
+                if has_any:
+                    self._apply_stats_axis_style(ax, "Morfometría Combinada", "Medida (cm)", "Frecuencia")
+                    ax.legend()
+                    self._add_to_gallery("🧬 Morfometría (H/W)", fig_to_pixmap(fig), "morphometry")
+                else:
+                    plt.close(fig)
+        except Exception as error:
+            self._stats_log_graph_error("Morfometría (H/W)", error)
 
         # Curva Peso
         try:
             if weekly_weights:
                 fig, ax = plt.subplots(figsize=(11, 5))
                 plot_bio_trend(ax, weekly_weights, '#9b59b6', 'Peso', 'g')
-                ax.set_title("Proyección de Crecimiento (Peso)", fontweight='bold')
-                ax.set_ylabel("Peso (g)"); ax.legend()
+                self._apply_stats_axis_style(ax, "Proyección de Crecimiento (Peso)", "Semana de muestreo", "Peso (g)")
+                ax.legend()
                 fig.autofmt_xdate(rotation=45, ha='right')
-                self._add_to_gallery("⏱ Crecimiento Peso", fig_to_pixmap(fig))
-        except Exception as e: print(f"Error Peso: {e}")
+                self._add_to_gallery("⏱ Crecimiento Peso", fig_to_pixmap(fig), "timeline_weight")
+        except Exception as error:
+            self._stats_log_graph_error("Crecimiento Peso", error)
 
         # Curva Longitud
         try:
             if weekly_lengths:
                 fig, ax = plt.subplots(figsize=(11, 5))
                 plot_bio_trend(ax, weekly_lengths, '#e67e22', 'Longitud', 'cm')
-                ax.set_title("Proyección de Crecimiento (Longitud)", fontweight='bold')
-                ax.set_ylabel("Longitud (cm)"); ax.legend()
+                self._apply_stats_axis_style(ax, "Proyección de Crecimiento (Longitud)", "Semana de muestreo", "Longitud (cm)")
+                ax.legend()
                 fig.autofmt_xdate(rotation=45, ha='right')
-                self._add_to_gallery("📏 Crecimiento Talla", fig_to_pixmap(fig))
-        except Exception as e: print(f"Error Longitud: {e}")
+                self._add_to_gallery("📏 Crecimiento Talla", fig_to_pixmap(fig), "timeline_length")
+        except Exception as error:
+            self._stats_log_graph_error("Crecimiento Talla", error)
 
         # Scatter
         try:
-            if len(data['lengths']) == len(data['weights']) and data['weights']:
+            if data['pairs']:
                 fig, ax = plt.subplots(figsize=(8, 5))
-                ax.scatter(data['lengths'], data['weights'], c='#e74c3c', alpha=0.6)
-                ax.set_title("Relación Longitud / Peso", fontweight='bold')
-                ax.set_xlabel("Longitud (cm)"); ax.set_ylabel("Peso (g)")
-                self._add_to_gallery("📈 Salud (L vs P)", fig_to_pixmap(fig))
-        except: pass
-    def _add_to_gallery(self, title, pixmap):
+                scatter_lengths = [pair[0] for pair in data['pairs']]
+                scatter_weights = [pair[1] for pair in data['pairs']]
+                ax.scatter(scatter_lengths, scatter_weights, c='#e74c3c', alpha=0.6, edgecolors='black', linewidths=0.4)
+                self._apply_stats_axis_style(ax, "Relación Longitud / Peso", "Longitud (cm)", "Peso (g)")
+                self._add_to_gallery("📈 Salud (L vs P)", fig_to_pixmap(fig), "correlation")
+        except Exception as error:
+            self._stats_log_graph_error("Relación Longitud/Peso", error)
+
+        # Factor K del lote
+        try:
+            if data['k_factors']:
+                fig, ax = plt.subplots(figsize=(8, 5))
+                ax.hist(data['k_factors'], bins=10, color='#16a085', alpha=0.75, edgecolor='black')
+                ax.axvspan(1.0, 1.4, color='#2ecc71', alpha=0.15, label='Zona óptima')
+                ax.axvline(np.mean(data['k_factors']), color='#0b5345', linestyle='--', linewidth=1.5, label=f"Prom: {np.mean(data['k_factors']):.3f}")
+                self._apply_stats_axis_style(ax, "Factor K del Lote", "Factor de condición K", "Frecuencia")
+                ax.legend()
+                self._add_to_gallery("🧬 Factor K del Lote", fig_to_pixmap(fig), "k_factor")
+        except Exception as error:
+            self._stats_log_graph_error("Factor K del Lote", error)
+
+        # Perfil corporal altura vs ancho
+        try:
+            body_records = [record for record in data['records'] if record.get('height', 0) > 0 and record.get('width', 0) > 0]
+            if body_records:
+                fig, ax = plt.subplots(figsize=(8, 5))
+                body_heights = [record['height'] for record in body_records]
+                body_widths = [record['width'] for record in body_records]
+                ax.scatter(body_widths, body_heights, c='#af7ac5', alpha=0.65, edgecolors='black', linewidths=0.4)
+                if len(body_widths) >= 2:
+                    coeffs = np.polyfit(body_widths, body_heights, 1)
+                    trend_x = np.linspace(min(body_widths), max(body_widths), 60)
+                    trend_y = np.poly1d(coeffs)(trend_x)
+                    ax.plot(trend_x, trend_y, '--', color='#5b2c6f', linewidth=1.4, label='Tendencia')
+                self._apply_stats_axis_style(ax, "Perfil Corporal del Lote", "Ancho dorsal (cm)", "Altura corporal (cm)")
+                if ax.get_legend_handles_labels()[0]:
+                    ax.legend()
+                self._add_to_gallery("📐 Perfil Corporal", fig_to_pixmap(fig), "body_profile")
+        except Exception as error:
+            self._stats_log_graph_error("Perfil Corporal", error)
+
+        # Variabilidad del lote
+        try:
+            metric_map = {
+                'Longitud': data['lengths'],
+                'Peso': data['weights'],
+                'Altura': data['heights'],
+                'Ancho': data['widths'],
+            }
+            labels = []
+            cvs = []
+            for label, values in metric_map.items():
+                if len(values) >= 2 and np.mean(values) > 0:
+                    labels.append(label)
+                    cvs.append((np.std(values) / np.mean(values)) * 100)
+
+            if labels:
+                fig, ax = plt.subplots(figsize=(8.8, 4.8))
+                colors_bar = ['#3498db', '#2ecc71', '#1abc9c', '#f1c40f'][:len(labels)]
+                bars = ax.bar(labels, cvs, color=colors_bar, edgecolor='black', alpha=0.8)
+                for bar, value in zip(bars, cvs):
+                    ax.text(bar.get_x() + bar.get_width() / 2, value + 0.4, f"{value:.1f}%", ha='center', va='bottom', fontsize=9, fontweight='bold')
+                self._apply_stats_axis_style(ax, "Variabilidad del Lote", "Indicador biométrico", "Coeficiente de variación (%)")
+                self._add_to_gallery("📦 Variabilidad del Lote", fig_to_pixmap(fig), "variability")
+        except Exception as error:
+            self._stats_log_graph_error("Variabilidad del Lote", error)
+
+        # Intensidad de muestreo semanal
+        try:
+            weekly_counts = self._build_weekly_metric_map(data['records'], 'length')
+            if weekly_counts:
+                fig, ax = plt.subplots(figsize=(10, 4.8))
+                weeks = sorted(weekly_counts.keys())
+                labels = [datetime.combine(week, datetime.min.time()) for week in weeks]
+                counts = [len(weekly_counts[week]) for week in weeks]
+                ax.bar(labels, counts, color='#5dade2', edgecolor='#1b4f72', width=5)
+                self._apply_stats_axis_style(ax, "Intensidad de Muestreo Semanal", "Semana", "Número de mediciones")
+                ax.xaxis.set_major_formatter(mdates.DateFormatter('%d/%b'))
+                fig.autofmt_xdate(rotation=45, ha='right')
+                self._add_to_gallery("📅 Muestreo Semanal", fig_to_pixmap(fig), "sampling_weekly")
+        except Exception as error:
+            self._stats_log_graph_error("Muestreo Semanal", error)
+
+        # Clases de talla
+        try:
+            if data['lengths']:
+                fig, ax = plt.subplots(figsize=(9, 4.8))
+                class_bins = min(7, max(4, int(np.sqrt(len(data['lengths'])))))
+                counts, bins = np.histogram(data['lengths'], bins=class_bins)
+                class_labels = [f"{bins[i]:.1f}-{bins[i + 1]:.1f}" for i in range(len(counts))]
+                bars = ax.bar(class_labels, counts, color='#2471a3', alpha=0.85, edgecolor='black')
+                for bar, value in zip(bars, counts):
+                    ax.text(bar.get_x() + bar.get_width() / 2, value + 0.2, str(int(value)), ha='center', va='bottom', fontsize=9, fontweight='bold')
+                self._apply_stats_axis_style(ax, "Clases de Talla del Lote", "Rango de longitud (cm)", "Cantidad")
+                ax.tick_params(axis='x', rotation=25)
+                self._add_to_gallery("📊 Clases de Talla", fig_to_pixmap(fig), "size_classes")
+        except Exception as error:
+            self._stats_log_graph_error("Clases de Talla", error)
+
+        # Tendencia semanal del factor K
+        try:
+            weekly_k = {}
+            for record in data['records']:
+                length_value = float(record.get('length') or 0)
+                weight_value = float(record.get('weight') or 0)
+                ts_value = record.get('timestamp')
+                if length_value <= 0 or weight_value <= 0 or ts_value is None:
+                    continue
+
+                k_value = (100 * weight_value) / (length_value ** 3)
+                monday = ts_value.date() - timedelta(days=ts_value.date().weekday())
+                weekly_k.setdefault(monday, []).append(k_value)
+
+            if weekly_k:
+                fig, ax = plt.subplots(figsize=(10, 4.8))
+                weeks = sorted(weekly_k.keys())
+                week_dates = [datetime.combine(week, datetime.min.time()) for week in weeks]
+                avg_k = [float(np.mean(weekly_k[week])) for week in weeks]
+                ax.plot(week_dates, avg_k, 'o-', color='#117864', linewidth=2, markersize=6, label='K semanal')
+                ax.axhspan(1.0, 1.4, color='#2ecc71', alpha=0.12, label='Zona óptima')
+                self._apply_stats_axis_style(ax, "Tendencia Semanal Factor K", "Semana", "Factor de condición K")
+                ax.xaxis.set_major_formatter(mdates.DateFormatter('%d/%b'))
+                fig.autofmt_xdate(rotation=45, ha='right')
+                ax.legend()
+                self._add_to_gallery("🫀 Tendencia Factor K", fig_to_pixmap(fig), "condition_trend")
+        except Exception as error:
+            self._stats_log_graph_error("Tendencia Factor K", error)
+
+    def _add_to_gallery(self, title, pixmap, graph_key=None):
         """Añade un gráfico a la galería usando un QPixmap en memoria."""
         item = QListWidgetItem(title)
         icon = QIcon(pixmap)
         item.setIcon(icon)
-        item.setSizeHint(QSize(200, 180))
+        item.setSizeHint(QSize(220, 190))
+        item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+        item.setToolTip(self._build_stats_graph_tooltip(graph_key))
         
         # Guardamos el Pixmap entero en la memoria del ítem
         item.setData(Qt.ItemDataRole.UserRole, pixmap)
+        item.setData(Qt.ItemDataRole.UserRole + 1, graph_key)
         
         self.gallery_list.addItem(item)
 
@@ -6372,11 +8298,6 @@ QPushButton[class="info"] {{
         scroll_area.setFrameShape(QFrame.Shape.NoFrame)
         
         lbl_image = QLabel()
-        lbl_image.setPixmap(pixmap.scaled(
-            dialog.size() * 0.95, 
-            Qt.AspectRatioMode.KeepAspectRatio, 
-            Qt.TransformationMode.SmoothTransformation
-        ))
         lbl_image.setAlignment(Qt.AlignmentFlag.AlignCenter)
         
         scroll_area.setWidget(lbl_image)
@@ -6389,10 +8310,25 @@ QPushButton[class="info"] {{
         btn_close.setToolTip("Cerrar el visor de imágenes.")
         btn_close.clicked.connect(dialog.accept)
         layout.addWidget(btn_close)
+
+        base_resize_event = dialog.resizeEvent
+
+        def _refresh_preview():
+            self._set_scaled_graph_preview(lbl_image, pixmap, scroll_area)
+
+        def _on_resize(event):
+            base_resize_event(event)
+            _refresh_preview()
+
+        dialog.resizeEvent = _on_resize
+        QTimer.singleShot(0, _refresh_preview)
         
         dialog.exec()
     
     def save_config(self):
+        if not self._validate_settings_ranges(show_message=True):
+            return
+
         Config.CAM_LEFT_INDEX = self.spin_cam_left.value()
         Config.CAM_TOP_INDEX = self.spin_cam_top.value()
         Config.MIN_CONTOUR_AREA = self.spin_min_area.value()
@@ -6426,6 +8362,14 @@ QPushButton[class="info"] {{
             'scale_back_left': self.scale_back_left,
             'scale_front_top': self.scale_front_top,
             'scale_back_top': self.scale_back_top,
+            'sensor_env_ranges': {
+                'temp_agua': [self.sensor_env_ranges['temp_agua'][0], self.sensor_env_ranges['temp_agua'][1]],
+                'ph': [self.sensor_env_ranges['ph'][0], self.sensor_env_ranges['ph'][1]],
+                'cond': [self.sensor_env_ranges['cond'][0], self.sensor_env_ranges['cond'][1]],
+                'turb': [self.sensor_env_ranges['turb'][0], self.sensor_env_ranges['turb'][1]],
+                'do': [self.sensor_env_ranges['do'][0], self.sensor_env_ranges['do'][1]],
+            },
+            'quick_notes': self.quick_notes,
             'hsv_left': hsv_left,  
             'hsv_top': hsv_top
         }
@@ -6446,6 +8390,7 @@ QPushButton[class="info"] {{
                 json.dump(config_data, f, indent=4)
             
             self.status_bar.set_status("Configuración guardada en disco y BD", "success")
+            self._set_settings_dirty(False)
             QMessageBox.information(self, "Éxito", "Configuración y Calibración guardadas correctamente.")
         except Exception as e:
             logger.error(f"Error escribiendo config.json: {e}")
@@ -6504,6 +8449,7 @@ QPushButton[class="info"] {{
         Se debe llamar SOLO DESPUÉS de initUI().
         """
         logger.info("Sincronizando widgets con la configuracion...")
+        self._settings_change_guard = True
         
         # Agrupamos widgets para bloquear sus señales temporalmente
         widgets_to_sync = [
@@ -6517,7 +8463,12 @@ QPushButton[class="info"] {{
             self.spin_val_min_lat, self.spin_val_max_lat,
             self.spin_hue_min_top, self.spin_hue_max_top,
             self.spin_sat_min_top, self.spin_sat_max_top,
-            self.spin_val_min_top, self.spin_val_max_top
+            self.spin_val_min_top, self.spin_val_max_top,
+            self.spin_env_temp_min, self.spin_env_temp_max,
+            self.spin_env_ph_min, self.spin_env_ph_max,
+            self.spin_env_cond_min, self.spin_env_cond_max,
+            self.spin_env_turb_min, self.spin_env_turb_max,
+            self.spin_env_do_min, self.spin_env_do_max,
         ]
 
         for w in widgets_to_sync:
@@ -6530,6 +8481,8 @@ QPushButton[class="info"] {{
             self.spin_min_area.setValue(Config.MIN_CONTOUR_AREA)
             self.spin_max_area.setValue(Config.MAX_CONTOUR_AREA)
             self.spin_confidence.setValue(Config.CONFIDENCE_THRESHOLD)
+            self.spin_min_length.setValue(Config.MIN_LENGTH_CM)
+            self.spin_max_length.setValue(Config.MAX_LENGTH_CM)
 
             # --- Escalas de Fotogrametría ---
             self.spin_scale_front_left.setValue(self.scale_front_left)
@@ -6553,7 +8506,23 @@ QPushButton[class="info"] {{
             self.spin_val_min_top.setValue(self.hsv_top_v_min)
             self.spin_val_max_top.setValue(self.hsv_top_v_max)
 
+            # --- Rangos de Alertas Ambientales ---
+            self.spin_env_temp_min.setValue(self.sensor_env_ranges["temp_agua"][0])
+            self.spin_env_temp_max.setValue(self.sensor_env_ranges["temp_agua"][1])
+            self.spin_env_ph_min.setValue(self.sensor_env_ranges["ph"][0])
+            self.spin_env_ph_max.setValue(self.sensor_env_ranges["ph"][1])
+            self.spin_env_cond_min.setValue(self.sensor_env_ranges["cond"][0])
+            self.spin_env_cond_max.setValue(self.sensor_env_ranges["cond"][1])
+            self.spin_env_turb_min.setValue(self.sensor_env_ranges["turb"][0])
+            self.spin_env_turb_max.setValue(self.sensor_env_ranges["turb"][1])
+            self.spin_env_do_min.setValue(self.sensor_env_ranges["do"][0])
+            self.spin_env_do_max.setValue(self.sensor_env_ranges["do"][1])
+
+            self._apply_sensor_ranges_from_ui()
+            self._refresh_quick_note_combos()
+
             self.status_bar.set_status("Interfaz sincronizada con éxito", "success")
+            self._set_settings_dirty(False)
 
         except Exception as e:
             logger.error(f"Error sincronizando UI: {e}")
@@ -6562,7 +8531,8 @@ QPushButton[class="info"] {{
             # Desbloquear señales para que el usuario pueda interactuar
             for w in widgets_to_sync:
                 w.blockSignals(False)   
-              
+            self._settings_change_guard = False
+
     def _parse_json_config(self, data):
         """Mapea el JSON plano a las variables de la instancia"""
         try:
@@ -6600,6 +8570,25 @@ QPushButton[class="info"] {{
                 self.hsv_top_s_max = h.get('s_max', 255)
                 self.hsv_top_v_min = h.get('v_min', 40)
                 self.hsv_top_v_max = h.get('v_max', 255)
+
+            # 5. Rangos de alerta ambiental para SensorTopBar
+            if 'sensor_env_ranges' in data and isinstance(data['sensor_env_ranges'], dict):
+                env = data['sensor_env_ranges']
+                for key in ("temp_agua", "ph", "cond", "turb", "do"):
+                    pair = env.get(key)
+                    if isinstance(pair, (list, tuple)) and len(pair) == 2:
+                        self.sensor_env_ranges[key] = (float(pair[0]), float(pair[1]))
+
+            # 6. Notas rápidas reutilizables
+            raw_notes = data.get('quick_notes')
+            if isinstance(raw_notes, list):
+                parsed_notes = []
+                for note in raw_notes:
+                    clean = self._normalize_note_text(note)
+                    if clean and clean.lower() not in [n.lower() for n in parsed_notes]:
+                        parsed_notes.append(clean)
+                if parsed_notes:
+                    self.quick_notes = parsed_notes[:25]
             
         except Exception as e:
             logger.error(f"Error parseando JSON: {e}")                
@@ -6642,14 +8631,23 @@ QPushButton[class="info"] {{
         """
         CALIBRACIÓN INDEPENDIENTE POR CÁMARA CON VISTA PREVIA SEGURA
         """
-        if not self.cap_left or not self.cap_top:
-            QMessageBox.warning(self, "Error", "Cámaras no disponibles")
+        left_ready = bool(self.cap_left and hasattr(self.cap_left, "isOpened") and self.cap_left.isOpened())
+        top_ready = bool(self.cap_top and hasattr(self.cap_top, "isOpened") and self.cap_top.isOpened())
+
+        if not (left_ready and top_ready):
+            self._set_fine_tune_enabled(False)
+            self._update_settings_camera_indicator(False, "Calibrador bloqueado")
+            QMessageBox.warning(self, "Error", "Cámaras no disponibles para calibración en vivo")
             return
 
         dialog = QDialog(self)
         dialog.setWindowTitle("Calibración Chroma Key en Vivo")
         dialog.setMinimumSize(1400, 900)
         layout = QVBoxLayout(dialog)
+
+        was_main_timer_active = bool(hasattr(self, 'timer') and self.timer.isActive())
+        if was_main_timer_active:
+            self.timer.stop()
 
         # 1. Cargar valores temporales (clonados de la configuración actual)
         self.temp_hsv_left = {
@@ -6813,7 +8811,11 @@ QPushButton[class="info"] {{
         btns.addWidget(btn_save)
         layout.addLayout(btns)
 
-        dialog.exec()   
+        dialog.exec()
+
+        if was_main_timer_active and self.cameras_connected and hasattr(self, 'timer'):
+            fps_ms = int(1000 / max(1, Config.PREVIEW_FPS))
+            self.timer.start(fps_ms)
         
     def init_tray(self):
         """Configura el icono en la barra de tareas (junto al reloj)."""
