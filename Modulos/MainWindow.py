@@ -44,7 +44,7 @@ from PySide6.QtWidgets import (
     QPushButton, QLabel, QTextEdit, QProgressBar,
     QTabWidget, QTabBar, QGroupBox, QFrame,
     QSpinBox, QDoubleSpinBox, QComboBox, QCheckBox,
-    QFileDialog, QMessageBox, QDialog, QLineEdit,
+    QFileDialog, QMessageBox, QDialog, QLineEdit, QInputDialog,
     QTableWidget, QTableWidgetItem, QHeaderView,
     QScrollArea, QListWidget, QListWidgetItem,
     QSizePolicy, QDateEdit, QTimeEdit,
@@ -167,6 +167,12 @@ class MainWindow(QMainWindow):
         self.current_frame_left = None 
         self.current_frame_top = None
         self.auto_capture_enabled = False
+        self.auto_capture_last_user_intent = False
+        self.auto_capture_keep_across_tabs = True
+        self.auto_capture_schedule_enforced = True
+        self.auto_capture_allowed_start_hour = 6
+        self.auto_capture_allowed_end_hour = 18
+        self.start_fullscreen_on_launch = True
         self.last_result = None
         self.cameras_connected = False
         self.scale_front_left = Config.SCALE_LAT_FRONT
@@ -192,6 +198,9 @@ class MainWindow(QMainWindow):
         self._settings_change_guard = False
         self._fallback_sensor_cache = {}
         self._last_fallback_sensor_pull = 0.0
+        self.species_profiles = {}
+        self.active_species_profile_name = ""
+        self._base_profile_names = set()
         self.sensor_env_ranges = {
             "temp_agua": (18.0, 32.0),
             "ph": (6.5, 8.5),
@@ -199,6 +208,8 @@ class MainWindow(QMainWindow):
             "turb": (0.0, 100.0),
             "do": (4.0, 14.0),
         }
+        self.sensor_bar_refresh_seconds = 2
+        self.sensor_top_bar_visible = True
         self.quick_notes = [
             "Sin observaciones",
             "Pez en buen estado",
@@ -218,6 +229,13 @@ class MainWindow(QMainWindow):
             'confidence_threshold': 0.6,
             'min_length_cm': 4.0,
             'max_length_cm': 50.0,
+            'auto_capture_keep_across_tabs': True,
+            'auto_capture_schedule_enforced': True,
+            'auto_capture_start_hour': 6,
+            'auto_capture_end_hour': 18,
+            'start_fullscreen_on_launch': True,
+            'sensor_bar_refresh_seconds': 2,
+            'sensor_top_bar_visible': True,
             'sensor_env_ranges': {
                 'temp_agua': (18.0, 32.0),
                 'ph': (6.5, 8.5),
@@ -258,10 +276,14 @@ class MainWindow(QMainWindow):
         
         # Conexión del motor de parpadeo
         self.alert_timer.timeout.connect(self.toggle_alert_icon)
+
+        self.auto_capture_schedule_timer = QTimer(self)
+        self.auto_capture_schedule_timer.timeout.connect(self._enforce_auto_capture_schedule)
         
         # 3. FINALMENTE INICIAMOS LOS TIMERS
         self.ram_timer.start(5000)
-        self.sensor_bar_timer.start(1500)
+        self.sensor_bar_timer.start(self.sensor_bar_refresh_seconds * 1000)
+        self.auto_capture_schedule_timer.start(30000)
         
         self.save_sound = QSoundEffect(self)
         self.save_sound.setSource(QUrl.fromLocalFile(os.path.abspath("save_ok.wav")))
@@ -315,6 +337,9 @@ class MainWindow(QMainWindow):
         self.processor.start()
         cameras_ok = self.start_cameras()
         self._configure_camera_tabs(cameras_ok, choose_startup=True)
+        self._enforce_auto_capture_schedule(force_ui_sync=True)
+        QTimer.singleShot(0, self._apply_startup_window_mode)
+        QTimer.singleShot(1200, self._bootstrap_statistics_panel)
         self.status_bar.set_status("Sistema listo. Esperando captura")
         
     def init_ui(self):
@@ -343,7 +368,6 @@ class MainWindow(QMainWindow):
         self.tabs.addTab(settings_tab, " Configuración")
 
         self.sensor_top_bar = SensorTopBar(self)
-        self.sensor_top_bar.btn_tablet.toggled.connect(self.toggle_tablet_mode)
         self.sensor_top_bar.set_ranges(self.sensor_env_ranges)
         self.tabs.setCornerWidget(self.sensor_top_bar, Qt.TopRightCorner)
         
@@ -406,6 +430,52 @@ class MainWindow(QMainWindow):
 
         self.sensor_top_bar.update_values(sensor_data)
 
+    def _bootstrap_statistics_panel(self) -> None:
+        """Genera el dashboard inicial si hay suficientes registros para hacerlo útil."""
+        if not hasattr(self, 'stats_text'):
+            return
+
+        try:
+            total_records = self.db.get_filtered_measurements_count()
+        except Exception:
+            total_records = 0
+
+        if total_records >= 5:
+            self.generate_statistics()
+        else:
+            self._render_statistics_empty_state(
+                "Cuando existan al menos 5 registros útiles, el sistema generará automáticamente un resumen inicial al arrancar."
+            )
+
+    def _apply_sensor_refresh_interval_from_ui(self) -> None:
+        """Aplica la frecuencia de refresco ambiental al timer."""
+        if hasattr(self, 'sensor_bar_timer') and hasattr(self, 'spin_sensor_refresh_seconds'):
+            seconds = max(1, int(self.spin_sensor_refresh_seconds.value()))
+            self.sensor_bar_refresh_seconds = seconds
+            self.sensor_bar_timer.setInterval(seconds * 1000)
+
+    def _update_sensor_top_bar_toggle_text(self) -> None:
+        if not hasattr(self, 'btn_toggle_sensor_top_bar'):
+            return
+
+        if getattr(self, 'sensor_top_bar_visible', True):
+            self.btn_toggle_sensor_top_bar.setText("Ocultar variables ambientales")
+            self.btn_toggle_sensor_top_bar.setToolTip("Oculta la barra superior de variables ambientales.")
+        else:
+            self.btn_toggle_sensor_top_bar.setText("Mostrar variables ambientales")
+            self.btn_toggle_sensor_top_bar.setToolTip("Muestra de nuevo la barra superior de variables ambientales.")
+
+    def toggle_sensor_top_bar_visibility(self, checked: bool) -> None:
+        """Muestra u oculta la barra de variables ambientales."""
+        self.sensor_top_bar_visible = bool(checked)
+        if hasattr(self, 'sensor_top_bar'):
+            self.sensor_top_bar.setVisible(self.sensor_top_bar_visible)
+        self._update_sensor_top_bar_toggle_text()
+        if hasattr(self, 'status_bar'):
+            msg = "Variables ambientales visibles" if self.sensor_top_bar_visible else "Variables ambientales ocultas"
+            state = "success" if self.sensor_top_bar_visible else "warning"
+            self.status_bar.set_status(msg, state)
+
     def _apply_sensor_ranges_from_ui(self):
         """Sincroniza rangos de alerta ambiental desde la pestaña Configuración."""
         if not all(hasattr(self, name) for name in (
@@ -434,6 +504,11 @@ class MainWindow(QMainWindow):
     def toggle_tablet_mode(self, enabled: bool):
         """Activa o desactiva modo táctil para mejorar uso sin mouse."""
         self.tablet_mode_enabled = enabled
+
+        if hasattr(self, "btn_tablet_mode") and self.btn_tablet_mode.isChecked() != enabled:
+            self.btn_tablet_mode.blockSignals(True)
+            self.btn_tablet_mode.setChecked(enabled)
+            self.btn_tablet_mode.blockSignals(False)
 
         theme = self.combo_theme.currentText() if hasattr(self, "combo_theme") else "Sistema"
 
@@ -1094,34 +1169,11 @@ class MainWindow(QMainWindow):
         if hasattr(self, 'processor') and hasattr(self.processor, 'motion_detector'):
             self.processor.motion_detector.reset()
 
-        # Si estaba activa la auto-captura, desactivarla correctamente
-        if hasattr(self, 'auto_capture_enabled') and self.auto_capture_enabled:
-            self.auto_capture_enabled = False
-
-            if hasattr(self, 'btn_auto_capture'):
-                self.btn_auto_capture.setChecked(False)
-
-                btn_class = "secondary"
-                icon_name = "fa5s.play"
-
-                self.btn_auto_capture.setText(" Iniciar Auto-Captura")
-                self.btn_auto_capture.setProperty("class", btn_class)
-
-                # Guardar metadatos para refresco en cambio de tema
-                self.btn_auto_capture._icon_name = icon_name
-                self.btn_auto_capture._icon_class = btn_class
-
-                # Regenerar icono con color correcto
-                icon_color = self._btn_text_colors.get(btn_class, "#ffffff")
-                self.btn_auto_capture.setIcon(
-                    qta.icon(icon_name, color=icon_color)
-                )
-                self.btn_auto_capture.setIconSize(QSize(18, 18))
-
-                # Refrescar estilos
-                self.btn_auto_capture.style().unpolish(self.btn_auto_capture)
-                self.btn_auto_capture.style().polish(self.btn_auto_capture)
-                self.btn_auto_capture.update()
+        # Si estaba activa la auto-captura, desactivarla solo si no se permite persistencia entre pestañas
+        keep_enabled = bool(getattr(self, 'auto_capture_keep_across_tabs', False))
+        if hasattr(self, 'auto_capture_enabled') and self.auto_capture_enabled and not keep_enabled:
+            self.auto_capture_last_user_intent = False
+            self._set_auto_capture_runtime_state(False, announce=False, reason="Cambio de pestaña")
 
         self.preview_fps = Config.PREVIEW_FPS
 
@@ -4038,14 +4090,14 @@ class MainWindow(QMainWindow):
         
         controls = QHBoxLayout()
 
-        btn_generate_stats = QPushButton("Generar Estadísticas")
+        btn_generate_stats = QPushButton("Actualizar Estadísticas")
         btn_generate_stats.setProperty("class", "primary")  
         btn_generate_stats.style().unpolish(btn_generate_stats)
         btn_generate_stats.style().polish(btn_generate_stats)
         btn_generate_stats.setCursor(Qt.PointingHandCursor)
         btn_generate_stats.setToolTip(
-            "Analiza las mediciones de la base de datos, calcula promedios<br>"
-            "y genera los gráficos visuales en la galería."
+            "Actualiza el panel con los datos más recientes de la base.<br>"
+            "Si hay suficientes mediciones, también genera los gráficos automáticamente."
         )
         btn_generate_stats.clicked.connect(self.generate_statistics)
         controls.addWidget(btn_generate_stats)
@@ -4097,8 +4149,9 @@ class MainWindow(QMainWindow):
         self.stats_text = QTextEdit()
         self.stats_text.setProperty("class", "report-text")
         self.stats_text.setReadOnly(True)
-        self.stats_text.setPlaceholderText("Genere estadísticas para ver el resumen analítico.")
+        self.stats_text.setPlaceholderText("Actualice estadísticas para ver el resumen analítico.")
         right_layout.addWidget(self.stats_text)
+        self._render_statistics_empty_state()
 
         self.splitter.addWidget(left_container)
         self.splitter.addWidget(self.stats_report_panel)
@@ -4226,6 +4279,32 @@ class MainWindow(QMainWindow):
         layout.addWidget(bottom_widget)
         
         return widget
+
+    def _render_statistics_empty_state(self, custom_message: str = "") -> None:
+        """Muestra un estado vacío útil cuando aún no hay estadísticas generadas."""
+        if not hasattr(self, 'stats_text'):
+            return
+
+        message = custom_message or (
+            "Todavía no hay un reporte generado. Cuando exista información, aquí verá el resumen "
+            "analítico, indicadores y observaciones del lote."
+        )
+
+        html = f"""
+        <div style='padding:18px; text-align:center; font-family:Segoe UI, sans-serif;'>
+            <div style='font-size:18px; font-weight:700; margin-bottom:10px;'>📊 Estadísticas sin generar</div>
+            <div style='max-width:720px; margin:0 auto; line-height:1.5; font-size:13px;'>
+                {message}
+            </div>
+            <div style='margin-top:18px; padding:14px; border:1px dashed #6c757d; border-radius:10px; opacity:0.95;'>
+                <div style='font-weight:700; margin-bottom:6px;'>Qué puedes hacer ahora</div>
+                <div>• Presiona <b>Actualizar Estadísticas</b> cuando ya haya mediciones en la base.</div>
+                <div>• Si todavía no existen registros, el sistema mostrará este panel como guía.</div>
+                <div>• Los gráficos aparecerán automáticamente después del primer análisis.</div>
+            </div>
+        </div>
+        """
+        self.stats_text.setHtml(html)
 
     def toggle_statistics_report(self, checked):
         """Permite mostrar u ocultar el panel de reporte detallado."""
@@ -5429,6 +5508,20 @@ QPushButton[class="info"] {{
         appearance_layout.addWidget(self.chk_high_contrast)
         self.chk_high_contrast.stateChanged.connect(self.apply_appearance)
 
+        self.chk_start_fullscreen = QCheckBox("Iniciar en pantalla completa")
+        self.chk_start_fullscreen.setCursor(Qt.PointingHandCursor)
+        self.chk_start_fullscreen.setToolTip("Si está activo, la aplicación abrirá maximizada al iniciar.")
+        self.chk_start_fullscreen.setChecked(True)
+        self.chk_start_fullscreen.stateChanged.connect(self.on_start_fullscreen_changed)
+        appearance_layout.addWidget(self.chk_start_fullscreen)
+
+        self.btn_tablet_mode = QPushButton("Modo táctil")
+        self.btn_tablet_mode.setCheckable(True)
+        self.btn_tablet_mode.setCursor(Qt.PointingHandCursor)
+        self.btn_tablet_mode.setToolTip("Activa una interfaz más cómoda para uso táctil.")
+        self.btn_tablet_mode.toggled.connect(self.toggle_tablet_mode)
+        appearance_layout.addWidget(self.btn_tablet_mode)
+
         # Tamaño de fuente
         appearance_layout.addWidget(QLabel("Fuente:"))
         self.combo_font_size = QComboBox()
@@ -5730,6 +5823,24 @@ QPushButton[class="info"] {{
         ):
             env_spin.valueChanged.connect(self._apply_sensor_ranges_from_ui)
 
+        env_layout.addWidget(QLabel("Frecuencia actualización (s)"), 6, 0)
+        self.spin_sensor_refresh_seconds = QSpinBox()
+        self.spin_sensor_refresh_seconds.setRange(1, 3600)
+        self.spin_sensor_refresh_seconds.setValue(self.sensor_bar_refresh_seconds)
+        self.spin_sensor_refresh_seconds.setSuffix(" s")
+        self.spin_sensor_refresh_seconds.setToolTip("Cada cuántos segundos se solicita y refresca la barra de variables ambientales.")
+        self.spin_sensor_refresh_seconds.valueChanged.connect(lambda _v: self._apply_sensor_refresh_interval_from_ui())
+        env_layout.addWidget(self.spin_sensor_refresh_seconds, 6, 1)
+
+        self.btn_toggle_sensor_top_bar = QPushButton("Ocultar variables ambientales")
+        self.btn_toggle_sensor_top_bar.setCheckable(True)
+        self.btn_toggle_sensor_top_bar.setChecked(True)
+        self.btn_toggle_sensor_top_bar.setProperty("class", "secondary")
+        self.btn_toggle_sensor_top_bar.setCursor(Qt.PointingHandCursor)
+        self.btn_toggle_sensor_top_bar.clicked.connect(self.toggle_sensor_top_bar_visibility)
+        env_layout.addWidget(self.btn_toggle_sensor_top_bar, 6, 2)
+        self._update_sensor_top_bar_toggle_text()
+
         layout.addWidget(env_group)
 
         validation_group = QGroupBox("Parámetros de Validación (Medidas Reales)")
@@ -5803,6 +5914,133 @@ QPushButton[class="info"] {{
 
         layout.addWidget(chroma_group)
 
+        advanced_group = QGroupBox("Configuraciones Avanzadas por Especie/Etapa")
+        advanced_layout = QVBoxLayout(advanced_group)
+
+        profile_row = QHBoxLayout()
+        profile_row.addWidget(QLabel("Perfil activo:"))
+        self.combo_species_profile = QComboBox()
+        self.combo_species_profile.setCursor(Qt.PointingHandCursor)
+        self.combo_species_profile.setToolTip("Seleccione un perfil para aplicar parámetros completos según especie o etapa.")
+        profile_row.addWidget(self.combo_species_profile, 1)
+
+        self.btn_apply_species_profile = QPushButton("Aplicar Perfil")
+        self.btn_apply_species_profile.setProperty("class", "info")
+        self.btn_apply_species_profile.setToolTip("Carga en la interfaz el perfil seleccionado y lo aplica al motor de medición.")
+        self.btn_apply_species_profile.clicked.connect(self.apply_selected_species_profile)
+        profile_row.addWidget(self.btn_apply_species_profile)
+
+        self.btn_save_species_profile = QPushButton("Guardar/Actualizar Perfil")
+        self.btn_save_species_profile.setProperty("class", "primary")
+        self.btn_save_species_profile.setToolTip("Guarda los valores actuales como un perfil editable personalizado.")
+        self.btn_save_species_profile.clicked.connect(self.save_species_profile_from_ui)
+        profile_row.addWidget(self.btn_save_species_profile)
+
+        self.btn_clone_species_profile = QPushButton("Clonar como Nuevo")
+        self.btn_clone_species_profile.setProperty("class", "secondary")
+        self.btn_clone_species_profile.setToolTip("Crea un perfil editable a partir del perfil seleccionado.")
+        self.btn_clone_species_profile.clicked.connect(self.clone_selected_species_profile)
+        profile_row.addWidget(self.btn_clone_species_profile)
+
+        self.btn_delete_species_profile = QPushButton("Eliminar Perfil")
+        self.btn_delete_species_profile.setProperty("class", "warning")
+        self.btn_delete_species_profile.clicked.connect(self.delete_selected_species_profile)
+        profile_row.addWidget(self.btn_delete_species_profile)
+
+        advanced_layout.addLayout(profile_row)
+
+        bio_grid = QGridLayout()
+        bio_grid.addWidget(QLabel("Densidad tejido (g/cm3):"), 0, 0)
+        self.spin_trout_density = QDoubleSpinBox(); self.spin_trout_density.setRange(0.1, 2.5); self.spin_trout_density.setDecimals(3)
+        self.spin_trout_density.setToolTip("Densidad promedio del tejido del pez. Se usa para estimar volumen y peso.")
+        bio_grid.addWidget(self.spin_trout_density, 0, 1)
+
+        bio_grid.addWidget(QLabel("Factor de forma:"), 0, 2)
+        self.spin_form_factor = QDoubleSpinBox(); self.spin_form_factor.setRange(0.5, 2.0); self.spin_form_factor.setDecimals(3)
+        self.spin_form_factor.setToolTip("Factor geométrico que ajusta el volumen estimado según la forma real del pez.")
+        bio_grid.addWidget(self.spin_form_factor, 0, 3)
+
+        bio_grid.addWidget(QLabel("Coeficiente K (W=K*L^b):"), 1, 0)
+        self.spin_weight_k = QDoubleSpinBox(); self.spin_weight_k.setRange(0.01, 2.0); self.spin_weight_k.setDecimals(4)
+        self.spin_weight_k.setToolTip("Constante del modelo peso-longitud. A mayor valor, mayor peso estimado para una misma longitud.")
+        bio_grid.addWidget(self.spin_weight_k, 1, 1)
+
+        bio_grid.addWidget(QLabel("Exponente b (W=K*L^b):"), 1, 2)
+        self.spin_weight_exp = QDoubleSpinBox(); self.spin_weight_exp.setRange(0.5, 4.0); self.spin_weight_exp.setDecimals(3)
+        self.spin_weight_exp.setToolTip("Exponente del modelo peso-longitud. Controla cómo crece el peso conforme aumenta el tamaño.")
+        bio_grid.addWidget(self.spin_weight_exp, 1, 3)
+
+        bio_grid.addWidget(QLabel("Bias global peso:"), 2, 0)
+        self.spin_weight_global_bias = QDoubleSpinBox(); self.spin_weight_global_bias.setRange(0.5, 1.5); self.spin_weight_global_bias.setDecimals(3)
+        self.spin_weight_global_bias.setToolTip("Corrección general para subir o bajar el peso estimado sin cambiar toda la fórmula.")
+        bio_grid.addWidget(self.spin_weight_global_bias, 2, 1)
+
+        bio_grid.addWidget(QLabel("Umbral alevin (cm):"), 2, 2)
+        self.spin_alevin_threshold = QDoubleSpinBox(); self.spin_alevin_threshold.setRange(1.0, 80.0); self.spin_alevin_threshold.setDecimals(2)
+        self.spin_alevin_threshold.setToolTip("Longitud a partir de la cual el pez deja de considerarse alevín.")
+        bio_grid.addWidget(self.spin_alevin_threshold, 2, 3)
+
+        bio_grid.addWidget(QLabel("Correccion Longitud:"), 3, 0)
+        self.spin_length_corr = QDoubleSpinBox(); self.spin_length_corr.setRange(0.5, 1.5); self.spin_length_corr.setDecimals(3)
+        self.spin_length_corr.setToolTip("Factor de corrección para la longitud final calculada.")
+        bio_grid.addWidget(self.spin_length_corr, 3, 1)
+
+        bio_grid.addWidget(QLabel("Correccion Altura:"), 3, 2)
+        self.spin_height_corr = QDoubleSpinBox(); self.spin_height_corr.setRange(0.5, 1.5); self.spin_height_corr.setDecimals(3)
+        self.spin_height_corr.setToolTip("Factor de corrección para la altura final calculada.")
+        bio_grid.addWidget(self.spin_height_corr, 3, 3)
+
+        bio_grid.addWidget(QLabel("Correccion Ancho:"), 4, 0)
+        self.spin_width_corr = QDoubleSpinBox(); self.spin_width_corr.setRange(0.5, 1.5); self.spin_width_corr.setDecimals(3)
+        self.spin_width_corr.setToolTip("Factor de corrección para el ancho final calculado.")
+        bio_grid.addWidget(self.spin_width_corr, 4, 1)
+
+        bio_grid.addWidget(QLabel("Correccion Peso:"), 4, 2)
+        self.spin_weight_corr = QDoubleSpinBox(); self.spin_weight_corr.setRange(0.5, 1.5); self.spin_weight_corr.setDecimals(3)
+        self.spin_weight_corr.setToolTip("Factor de corrección para el peso estimado final.")
+        bio_grid.addWidget(self.spin_weight_corr, 4, 3)
+
+        advanced_layout.addLayout(bio_grid)
+        layout.addWidget(advanced_group)
+
+        schedule_group = QGroupBox("Ventana Horaria de Auto-Captura")
+        schedule_layout = QGridLayout(schedule_group)
+        self.chk_auto_capture_schedule = QCheckBox("Restringir auto-captura por horario")
+        self.chk_auto_capture_schedule.setChecked(True)
+        self.chk_auto_capture_schedule.setToolTip("Si está activo, la auto-captura solo operará dentro del rango horario configurado.")
+        self.chk_auto_capture_schedule.toggled.connect(self.on_auto_capture_schedule_changed)
+        schedule_layout.addWidget(self.chk_auto_capture_schedule, 0, 0, 1, 2)
+
+        schedule_layout.addWidget(QLabel("Hora inicio:"), 1, 0)
+        self.spin_auto_capture_start = QSpinBox()
+        self.spin_auto_capture_start.setRange(0, 23)
+        self.spin_auto_capture_start.setValue(6)
+        self.spin_auto_capture_start.setSuffix(":00")
+        self.spin_auto_capture_start.setToolTip("Hora desde la que la auto-captura puede reactivarse o funcionar.")
+        self.spin_auto_capture_start.valueChanged.connect(self.on_auto_capture_schedule_changed)
+        schedule_layout.addWidget(self.spin_auto_capture_start, 1, 1)
+
+        schedule_layout.addWidget(QLabel("Hora fin:"), 2, 0)
+        self.spin_auto_capture_end = QSpinBox()
+        self.spin_auto_capture_end.setRange(0, 23)
+        self.spin_auto_capture_end.setValue(18)
+        self.spin_auto_capture_end.setSuffix(":00")
+        self.spin_auto_capture_end.setToolTip("Hora a partir de la cual la auto-captura se pausa por seguridad.")
+        self.spin_auto_capture_end.valueChanged.connect(self.on_auto_capture_schedule_changed)
+        schedule_layout.addWidget(self.spin_auto_capture_end, 2, 1)
+
+        self.lbl_auto_capture_schedule = QLabel("Horario actual: 06:00-18:00")
+        self.lbl_auto_capture_schedule.setProperty("state", "info")
+        schedule_layout.addWidget(self.lbl_auto_capture_schedule, 3, 0, 1, 2)
+
+        self.chk_auto_capture_keep_tabs = QCheckBox("Mantener auto-captura al cambiar de pestaña")
+        self.chk_auto_capture_keep_tabs.setChecked(True)
+        self.chk_auto_capture_keep_tabs.setToolTip("Si está activo, la intención de auto-captura se conserva al navegar entre pestañas.")
+        self.chk_auto_capture_keep_tabs.toggled.connect(lambda _v: self._mark_settings_dirty(reason="persistencia auto-captura"))
+        schedule_layout.addWidget(self.chk_auto_capture_keep_tabs, 4, 0, 1, 2)
+
+        layout.addWidget(schedule_group)
+
         btn_save_config = QPushButton("Guardar Configuración")
         self.btn_save_config = btn_save_config
         btn_save_config.setProperty("class", "primary")
@@ -5835,6 +6073,8 @@ QPushButton[class="info"] {{
             env_group,
             validation_group,
             chroma_group,
+            advanced_group,
+            schedule_group,
         ):
             section.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Maximum)
 
@@ -5847,6 +6087,378 @@ QPushButton[class="info"] {{
 
         scroll.setWidget(widget)
         return scroll
+
+    def _collect_species_profile_snapshot_from_ui(self) -> dict:
+        """Construye un snapshot completo de parametros para perfil por especie."""
+        return {
+            'general': {
+                'cam_left_index': int(self.spin_cam_left.value()),
+                'cam_top_index': int(self.spin_cam_top.value()),
+                'min_contour_area': int(self.spin_min_area.value()),
+                'max_contour_area': int(self.spin_max_area.value()),
+                'confidence_threshold': float(self.spin_confidence.value()),
+                'min_length_cm': float(self.spin_min_length.value()),
+                'max_length_cm': float(self.spin_max_length.value()),
+            },
+            'scales': {
+                'scale_front_left': float(self.spin_scale_front_left.value()),
+                'scale_back_left': float(self.spin_scale_back_left.value()),
+                'scale_front_top': float(self.spin_scale_front_top.value()),
+                'scale_back_top': float(self.spin_scale_back_top.value()),
+            },
+            'hsv_left': {
+                'h_min': int(self.spin_hue_min_lat.value()),
+                'h_max': int(self.spin_hue_max_lat.value()),
+                's_min': int(self.spin_sat_min_lat.value()),
+                's_max': int(self.spin_sat_max_lat.value()),
+                'v_min': int(self.spin_val_min_lat.value()),
+                'v_max': int(self.spin_val_max_lat.value()),
+            },
+            'hsv_top': {
+                'h_min': int(self.spin_hue_min_top.value()),
+                'h_max': int(self.spin_hue_max_top.value()),
+                's_min': int(self.spin_sat_min_top.value()),
+                's_max': int(self.spin_sat_max_top.value()),
+                'v_min': int(self.spin_val_min_top.value()),
+                'v_max': int(self.spin_val_max_top.value()),
+            },
+            'bio': {
+                'trout_density': float(self.spin_trout_density.value()),
+                'form_factor': float(self.spin_form_factor.value()),
+                'weight_k': float(self.spin_weight_k.value()),
+                'weight_exp': float(self.spin_weight_exp.value()),
+                'weight_global_bias': float(self.spin_weight_global_bias.value()),
+                'alevin_threshold_cm': float(self.spin_alevin_threshold.value()),
+                'length_correction_factor': float(self.spin_length_corr.value()),
+                'height_correction_factor': float(self.spin_height_corr.value()),
+                'width_correction_factor': float(self.spin_width_corr.value()),
+                'weight_correction_factor': float(self.spin_weight_corr.value()),
+            },
+            'updated_at': datetime.now().isoformat(timespec='seconds'),
+        }
+
+    def _build_species_profile_snapshot_from_state(self) -> dict:
+        """Genera un snapshot por defecto desde el estado actual cargado."""
+        return {
+            'general': {
+                'cam_left_index': int(Config.CAM_LEFT_INDEX),
+                'cam_top_index': int(Config.CAM_TOP_INDEX),
+                'min_contour_area': int(Config.MIN_CONTOUR_AREA),
+                'max_contour_area': int(Config.MAX_CONTOUR_AREA),
+                'confidence_threshold': float(Config.CONFIDENCE_THRESHOLD),
+                'min_length_cm': float(Config.MIN_LENGTH_CM),
+                'max_length_cm': float(Config.MAX_LENGTH_CM),
+            },
+            'scales': {
+                'scale_front_left': float(self.scale_front_left),
+                'scale_back_left': float(self.scale_back_left),
+                'scale_front_top': float(self.scale_front_top),
+                'scale_back_top': float(self.scale_back_top),
+            },
+            'hsv_left': {
+                'h_min': int(self.hsv_left_h_min),
+                'h_max': int(self.hsv_left_h_max),
+                's_min': int(self.hsv_left_s_min),
+                's_max': int(self.hsv_left_s_max),
+                'v_min': int(self.hsv_left_v_min),
+                'v_max': int(self.hsv_left_v_max),
+            },
+            'hsv_top': {
+                'h_min': int(self.hsv_top_h_min),
+                'h_max': int(self.hsv_top_h_max),
+                's_min': int(self.hsv_top_s_min),
+                's_max': int(self.hsv_top_s_max),
+                'v_min': int(self.hsv_top_v_min),
+                'v_max': int(self.hsv_top_v_max),
+            },
+            'bio': {
+                'trout_density': float(Config.TROUT_DENSITY),
+                'form_factor': float(Config.FORM_FACTOR),
+                'weight_k': float(Config.WEIGHT_K),
+                'weight_exp': float(Config.WEIGHT_EXP),
+                'weight_global_bias': float(Config.WEIGHT_GLOBAL_BIAS),
+                'alevin_threshold_cm': float(Config.ALEVIN_THRESHOLD_CM),
+                'length_correction_factor': float(Config.LENGTH_CORRECTION_FACTOR),
+                'height_correction_factor': float(Config.HEIGHT_CORRECTION_FACTOR),
+                'width_correction_factor': float(Config.WIDTH_CORRECTION_FACTOR),
+                'weight_correction_factor': float(Config.WEIGHT_CORRECTION_FACTOR),
+            },
+            'updated_at': datetime.now().isoformat(timespec='seconds'),
+        }
+
+    def _build_default_species_profiles(self) -> dict:
+        """Crea 3 perfiles base recomendados por etapa productiva."""
+        base = self._build_species_profile_snapshot_from_state()
+
+        def clone_profile(src: dict) -> dict:
+            return json.loads(json.dumps(src))
+
+        p_alevin = clone_profile(base)
+        p_alevin['general']['min_length_cm'] = 4.0
+        p_alevin['general']['max_length_cm'] = 18.0
+        p_alevin['general']['min_contour_area'] = 900
+        p_alevin['general']['max_contour_area'] = 14000
+        p_alevin['bio']['alevin_threshold_cm'] = 14.0
+        p_alevin['bio']['weight_k'] = 0.19
+        p_alevin['bio']['weight_exp'] = 1.82
+
+        p_juvenil = clone_profile(base)
+        p_juvenil['general']['min_length_cm'] = 12.0
+        p_juvenil['general']['max_length_cm'] = 35.0
+        p_juvenil['general']['min_contour_area'] = 1300
+        p_juvenil['general']['max_contour_area'] = 26000
+        p_juvenil['bio']['alevin_threshold_cm'] = 16.0
+        p_juvenil['bio']['weight_k'] = 0.20
+        p_juvenil['bio']['weight_exp'] = 1.88
+
+        p_engorde = clone_profile(base)
+        p_engorde['general']['min_length_cm'] = 28.0
+        p_engorde['general']['max_length_cm'] = 60.0
+        p_engorde['general']['min_contour_area'] = 1800
+        p_engorde['general']['max_contour_area'] = 42000
+        p_engorde['bio']['alevin_threshold_cm'] = 18.0
+        p_engorde['bio']['weight_k'] = 0.21
+        p_engorde['bio']['weight_exp'] = 1.95
+
+        defaults = {
+            "Base - Trucha Alevin": p_alevin,
+            "Base - Trucha Juvenil": p_juvenil,
+            "Base - Trucha Engorde": p_engorde,
+        }
+        self._base_profile_names = set(defaults.keys())
+        return defaults
+
+    def _ensure_base_species_profiles(self) -> None:
+        """Garantiza que los perfiles base existan y no se pierdan en migraciones."""
+        defaults = self._build_default_species_profiles()
+        for name, profile in defaults.items():
+            if name not in self.species_profiles:
+                self.species_profiles[name] = profile
+
+    def _is_base_profile(self, profile_name: str) -> bool:
+        return str(profile_name or "").strip() in self._base_profile_names
+
+    def on_start_fullscreen_changed(self, _value=None) -> None:
+        self.start_fullscreen_on_launch = bool(self.chk_start_fullscreen.isChecked())
+        self._mark_settings_dirty(reason="inicio pantalla completa")
+
+    def _apply_startup_window_mode(self) -> None:
+        if self.start_fullscreen_on_launch:
+            self.showMaximized()
+
+    def _apply_species_profile_to_state(self, profile: dict) -> None:
+        """Aplica perfil a variables de runtime (Config + estado interno)."""
+        if not isinstance(profile, dict):
+            return
+
+        general = profile.get('general', {}) or {}
+        Config.CAM_LEFT_INDEX = int(general.get('cam_left_index', Config.CAM_LEFT_INDEX))
+        Config.CAM_TOP_INDEX = int(general.get('cam_top_index', Config.CAM_TOP_INDEX))
+        Config.MIN_CONTOUR_AREA = int(general.get('min_contour_area', Config.MIN_CONTOUR_AREA))
+        Config.MAX_CONTOUR_AREA = int(general.get('max_contour_area', Config.MAX_CONTOUR_AREA))
+        Config.CONFIDENCE_THRESHOLD = float(general.get('confidence_threshold', Config.CONFIDENCE_THRESHOLD))
+        Config.MIN_LENGTH_CM = float(general.get('min_length_cm', Config.MIN_LENGTH_CM))
+        Config.MAX_LENGTH_CM = float(general.get('max_length_cm', Config.MAX_LENGTH_CM))
+
+        scales = profile.get('scales', {}) or {}
+        self.scale_front_left = float(scales.get('scale_front_left', self.scale_front_left))
+        self.scale_back_left = float(scales.get('scale_back_left', self.scale_back_left))
+        self.scale_front_top = float(scales.get('scale_front_top', self.scale_front_top))
+        self.scale_back_top = float(scales.get('scale_back_top', self.scale_back_top))
+
+        hsv_left = profile.get('hsv_left', {}) or {}
+        self.hsv_left_h_min = int(hsv_left.get('h_min', self.hsv_left_h_min))
+        self.hsv_left_h_max = int(hsv_left.get('h_max', self.hsv_left_h_max))
+        self.hsv_left_s_min = int(hsv_left.get('s_min', self.hsv_left_s_min))
+        self.hsv_left_s_max = int(hsv_left.get('s_max', self.hsv_left_s_max))
+        self.hsv_left_v_min = int(hsv_left.get('v_min', self.hsv_left_v_min))
+        self.hsv_left_v_max = int(hsv_left.get('v_max', self.hsv_left_v_max))
+
+        hsv_top = profile.get('hsv_top', {}) or {}
+        self.hsv_top_h_min = int(hsv_top.get('h_min', self.hsv_top_h_min))
+        self.hsv_top_h_max = int(hsv_top.get('h_max', self.hsv_top_h_max))
+        self.hsv_top_s_min = int(hsv_top.get('s_min', self.hsv_top_s_min))
+        self.hsv_top_s_max = int(hsv_top.get('s_max', self.hsv_top_s_max))
+        self.hsv_top_v_min = int(hsv_top.get('v_min', self.hsv_top_v_min))
+        self.hsv_top_v_max = int(hsv_top.get('v_max', self.hsv_top_v_max))
+
+        bio = profile.get('bio', {}) or {}
+        Config.TROUT_DENSITY = float(bio.get('trout_density', Config.TROUT_DENSITY))
+        Config.FORM_FACTOR = float(bio.get('form_factor', Config.FORM_FACTOR))
+        Config.WEIGHT_K = float(bio.get('weight_k', Config.WEIGHT_K))
+        Config.WEIGHT_EXP = float(bio.get('weight_exp', Config.WEIGHT_EXP))
+        Config.WEIGHT_GLOBAL_BIAS = float(bio.get('weight_global_bias', Config.WEIGHT_GLOBAL_BIAS))
+        Config.ALEVIN_THRESHOLD_CM = float(bio.get('alevin_threshold_cm', Config.ALEVIN_THRESHOLD_CM))
+        Config.LENGTH_CORRECTION_FACTOR = float(bio.get('length_correction_factor', Config.LENGTH_CORRECTION_FACTOR))
+        Config.HEIGHT_CORRECTION_FACTOR = float(bio.get('height_correction_factor', Config.HEIGHT_CORRECTION_FACTOR))
+        Config.WIDTH_CORRECTION_FACTOR = float(bio.get('width_correction_factor', Config.WIDTH_CORRECTION_FACTOR))
+        Config.WEIGHT_CORRECTION_FACTOR = float(bio.get('weight_correction_factor', Config.WEIGHT_CORRECTION_FACTOR))
+
+    def _refresh_species_profile_combo(self) -> None:
+        combo = getattr(self, 'combo_species_profile', None)
+        if combo is None:
+            return
+
+        self._ensure_base_species_profiles()
+        combo.blockSignals(True)
+        combo.clear()
+        sorted_names = sorted(
+            self.species_profiles.keys(),
+            key=lambda n: (0 if self._is_base_profile(n) else 1, n.lower())
+        )
+        for name in sorted_names:
+            combo.addItem(name)
+
+        if combo.count() == 0:
+            defaults = self._build_default_species_profiles()
+            self.species_profiles.update(defaults)
+            for name in sorted(defaults.keys()):
+                combo.addItem(name)
+
+        current = self.active_species_profile_name or combo.currentText()
+        idx = combo.findText(current)
+        if idx >= 0:
+            combo.setCurrentIndex(idx)
+        else:
+            combo.setCurrentIndex(0)
+            self.active_species_profile_name = combo.currentText()
+
+        combo.blockSignals(False)
+
+    def save_species_profile_from_ui(self) -> None:
+        """Guarda o actualiza perfil avanzado usando los valores actuales de UI."""
+        default_name = (self.combo_species_profile.currentText() if hasattr(self, 'combo_species_profile') else "").strip()
+        if self._is_base_profile(default_name):
+            default_name = ""
+
+        profile_name, ok = QInputDialog.getText(
+            self,
+            "Guardar Perfil",
+            "Nombre del perfil (ej: Trucha-Arcoiris | Alevin Invierno):",
+            text=default_name or ("Trucha-Base" if self._is_base_profile(self.active_species_profile_name) else self.active_species_profile_name) or "Trucha-Base",
+        )
+        if not ok:
+            return
+
+        profile_name = self._normalize_note_text(profile_name)
+        if len(profile_name) < 3:
+            QMessageBox.warning(self, "Perfil inválido", "Ingrese un nombre de perfil más descriptivo.")
+            return
+
+        if self._is_base_profile(profile_name):
+            QMessageBox.warning(
+                self,
+                "Perfil protegido",
+                "Los perfiles base son solo de aplicación. Use 'Clonar como Nuevo' para crear uno editable.",
+            )
+            return
+
+        self.species_profiles[profile_name] = self._collect_species_profile_snapshot_from_ui()
+        self.active_species_profile_name = profile_name
+        self._refresh_species_profile_combo()
+        self._set_settings_dirty(True, "perfil actualizado")
+        self.status_bar.set_status(f"Perfil '{profile_name}' actualizado. Falta guardar configuración.", "warning")
+
+    def clone_selected_species_profile(self) -> None:
+        """Clona el perfil seleccionado para crear una variante editable."""
+        source_name = self.combo_species_profile.currentText().strip() if hasattr(self, 'combo_species_profile') else ""
+        if not source_name or source_name not in self.species_profiles:
+            QMessageBox.warning(self, "Perfil no disponible", "Seleccione un perfil válido para clonar.")
+            return
+
+        new_name, ok = QInputDialog.getText(
+            self,
+            "Clonar Perfil",
+            "Nuevo nombre del perfil clonado:",
+            text=f"{source_name} - Mi Perfil",
+        )
+        if not ok:
+            return
+
+        new_name = self._normalize_note_text(new_name)
+        if len(new_name) < 3:
+            QMessageBox.warning(self, "Nombre inválido", "Ingrese un nombre más descriptivo para el nuevo perfil.")
+            return
+        if new_name in self.species_profiles:
+            QMessageBox.warning(self, "Nombre en uso", "Ya existe un perfil con ese nombre.")
+            return
+        if self._is_base_profile(new_name):
+            QMessageBox.warning(self, "Nombre reservado", "Ese nombre corresponde a un perfil base protegido.")
+            return
+
+        self.species_profiles[new_name] = json.loads(json.dumps(self.species_profiles[source_name]))
+        self.species_profiles[new_name]['updated_at'] = datetime.now().isoformat(timespec='seconds')
+        self.active_species_profile_name = new_name
+        self._refresh_species_profile_combo()
+        self.status_bar.set_status(f"Perfil clonado: '{new_name}'. Ya puede editarlo y guardarlo.", "success")
+        self._set_settings_dirty(True, "perfil clonado")
+
+    def apply_selected_species_profile(self) -> None:
+        """Aplica en caliente el perfil seleccionado a runtime y UI."""
+        profile_name = self.combo_species_profile.currentText().strip() if hasattr(self, 'combo_species_profile') else ""
+        if not profile_name or profile_name not in self.species_profiles:
+            QMessageBox.warning(self, "Perfil no disponible", "Seleccione un perfil válido para aplicar.")
+            return
+
+        profile = self.species_profiles.get(profile_name)
+        self._apply_species_profile_to_state(profile)
+        self.active_species_profile_name = profile_name
+        self.sync_ui_with_config()
+        self.apply_manual_calibration(silent=True)
+        self.update_cache()
+        self.status_bar.set_status(f"Perfil '{profile_name}' aplicado. Guarde si desea persistirlo.", "info")
+        self._set_settings_dirty(True, "perfil aplicado")
+
+    def delete_selected_species_profile(self) -> None:
+        """Elimina perfil seleccionado preservando al menos un perfil base."""
+        profile_name = self.combo_species_profile.currentText().strip() if hasattr(self, 'combo_species_profile') else ""
+        if not profile_name or profile_name not in self.species_profiles:
+            return
+
+        if self._is_base_profile(profile_name):
+            QMessageBox.warning(
+                self,
+                "Perfil protegido",
+                "Los perfiles base no se pueden eliminar. Use 'Clonar como Nuevo' para personalizar.",
+            )
+            return
+
+        if len(self.species_profiles) <= 1:
+            QMessageBox.warning(self, "Operación bloqueada", "Debe existir al menos un perfil.")
+            return
+
+        reply = QMessageBox.question(
+            self,
+            "Eliminar Perfil",
+            f"¿Eliminar el perfil '{profile_name}'?",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+        )
+        if reply != QMessageBox.StandardButton.Yes:
+            return
+
+        self.species_profiles.pop(profile_name, None)
+        if self.active_species_profile_name == profile_name:
+            self.active_species_profile_name = sorted(self.species_profiles.keys())[0]
+        self._refresh_species_profile_combo()
+        self._set_settings_dirty(True, "perfil eliminado")
+        self.status_bar.set_status(f"Perfil '{profile_name}' eliminado. Falta guardar configuración.", "warning")
+
+    def on_auto_capture_schedule_changed(self, _value=None) -> None:
+        """Sincroniza ajustes de horario con runtime y estado visual."""
+        self.auto_capture_schedule_enforced = bool(self.chk_auto_capture_schedule.isChecked())
+        self.auto_capture_allowed_start_hour = int(self.spin_auto_capture_start.value())
+        self.auto_capture_allowed_end_hour = int(self.spin_auto_capture_end.value())
+        self.auto_capture_keep_across_tabs = bool(self.chk_auto_capture_keep_tabs.isChecked())
+        self.start_fullscreen_on_launch = bool(self.chk_start_fullscreen.isChecked())
+
+        if hasattr(self, 'lbl_auto_capture_schedule'):
+            mode = "Restringido" if self.auto_capture_schedule_enforced else "Libre"
+            self.lbl_auto_capture_schedule.setText(
+                f"Horario actual: {self._auto_capture_window_label()} ({mode})"
+            )
+
+        self._enforce_auto_capture_schedule(force_ui_sync=True)
+        self._mark_settings_dirty(reason="horario auto-captura")
 
     def _set_settings_dirty(self, dirty: bool, reason: str = "") -> None:
         """Actualiza estado visual de cambios pendientes en Configuración."""
@@ -5917,6 +6529,25 @@ QPushButton[class="info"] {{
             getattr(self, 'spin_env_turb_max', None),
             getattr(self, 'spin_env_do_min', None),
             getattr(self, 'spin_env_do_max', None),
+            getattr(self, 'spin_sensor_refresh_seconds', None),
+            getattr(self, 'spin_trout_density', None),
+            getattr(self, 'spin_form_factor', None),
+            getattr(self, 'spin_weight_k', None),
+            getattr(self, 'spin_sensor_refresh_seconds', None),
+            getattr(self, 'btn_toggle_sensor_top_bar', None),
+            getattr(self, 'spin_weight_exp', None),
+            getattr(self, 'spin_weight_global_bias', None),
+            getattr(self, 'spin_alevin_threshold', None),
+            getattr(self, 'spin_length_corr', None),
+            getattr(self, 'spin_height_corr', None),
+            getattr(self, 'spin_width_corr', None),
+            getattr(self, 'spin_weight_corr', None),
+            getattr(self, 'chk_auto_capture_schedule', None),
+            getattr(self, 'spin_auto_capture_start', None),
+            getattr(self, 'spin_auto_capture_end', None),
+            getattr(self, 'chk_auto_capture_keep_tabs', None),
+            getattr(self, 'chk_start_fullscreen', None),
+            getattr(self, 'combo_species_profile', None),
         ]
 
         for widget in tracked_widgets:
@@ -5929,6 +6560,8 @@ QPushButton[class="info"] {{
                 widget.currentIndexChanged.connect(lambda _idx, w=widget: self._mark_settings_dirty(reason=w.objectName() or "combo"))
             elif isinstance(widget, QCheckBox):
                 widget.stateChanged.connect(lambda _state, w=widget: self._mark_settings_dirty(reason=w.text() or "check"))
+            elif isinstance(widget, QPushButton) and widget.isCheckable():
+                widget.toggled.connect(lambda _checked, w=widget: self._mark_settings_dirty(reason=w.text() or "boton"))
             else:
                 try:
                     widget.valueChanged.connect(lambda _value, w=widget: self._mark_settings_dirty(reason=w.objectName() or "valor"))
@@ -5973,6 +6606,20 @@ QPushButton[class="info"] {{
             if v_min > v_max:
                 issues.append(f"{name}: Val min no puede ser mayor que Val max.")
 
+        if self.spin_trout_density.value() <= 0:
+            issues.append("Densidad del tejido debe ser mayor que 0.")
+        if self.spin_form_factor.value() <= 0:
+            issues.append("Factor de forma debe ser mayor que 0.")
+        if self.spin_weight_k.value() <= 0 or self.spin_weight_exp.value() <= 0:
+            issues.append("Parámetros K y b del modelo peso-longitud deben ser mayores que 0.")
+
+        if self.chk_auto_capture_schedule.isChecked():
+            if self.spin_auto_capture_start.value() == self.spin_auto_capture_end.value():
+                issues.append("Horario auto-captura: inicio y fin no deben ser iguales (o desactive la restricción horaria).")
+
+        if self.spin_sensor_refresh_seconds.value() < 1:
+            issues.append("Frecuencia de actualización ambiental debe ser al menos 1 segundo.")
+
         if issues and show_message:
             QMessageBox.warning(
                 self,
@@ -6012,6 +6659,11 @@ QPushButton[class="info"] {{
             self.spin_confidence.setValue(defaults['confidence_threshold'])
             self.spin_min_length.setValue(defaults['min_length_cm'])
             self.spin_max_length.setValue(defaults['max_length_cm'])
+            self.chk_start_fullscreen.setChecked(defaults['start_fullscreen_on_launch'])
+            self.chk_auto_capture_keep_tabs.setChecked(defaults['auto_capture_keep_across_tabs'])
+            self.chk_auto_capture_schedule.setChecked(defaults['auto_capture_schedule_enforced'])
+            self.spin_auto_capture_start.setValue(defaults['auto_capture_start_hour'])
+            self.spin_auto_capture_end.setValue(defaults['auto_capture_end_hour'])
 
             self.spin_env_temp_min.setValue(defaults['sensor_env_ranges']['temp_agua'][0])
             self.spin_env_temp_max.setValue(defaults['sensor_env_ranges']['temp_agua'][1])
@@ -6023,8 +6675,13 @@ QPushButton[class="info"] {{
             self.spin_env_turb_max.setValue(defaults['sensor_env_ranges']['turb'][1])
             self.spin_env_do_min.setValue(defaults['sensor_env_ranges']['do'][0])
             self.spin_env_do_max.setValue(defaults['sensor_env_ranges']['do'][1])
+            self.spin_sensor_refresh_seconds.setValue(defaults['sensor_bar_refresh_seconds'])
+            self.btn_toggle_sensor_top_bar.setChecked(defaults['sensor_top_bar_visible'])
 
             self._apply_sensor_ranges_from_ui()
+            self._apply_sensor_refresh_interval_from_ui()
+            self.toggle_sensor_top_bar_visibility(defaults['sensor_top_bar_visible'])
+            self.on_auto_capture_schedule_changed()
             self.apply_appearance()
             self.update_cache()
         finally:
@@ -6759,6 +7416,9 @@ QPushButton[class="info"] {{
         """🚀 MOTOR ULTRA-RÁPIDO: Mantiene 60 FPS estables"""
         if self.current_tab not in [0, 1] or not self.cameras_connected or not self.cap_left or not self.cap_top:
             return
+
+        if self.current_tab == 0 and (self.auto_capture_enabled or self.auto_capture_last_user_intent):
+            self._enforce_auto_capture_schedule()
         
         # 1. Captura de frames (Thread-Safe)
         ret_l, frame_l = self.cap_left.read()
@@ -6920,55 +7580,126 @@ QPushButton[class="info"] {{
             self.spin_sat_min_top.value(), self.spin_sat_max_top.value(),
             self.spin_val_min_top.value(), self.spin_val_max_top.value()
         ]
+
+    def _is_within_auto_capture_window(self, now=None) -> bool:
+        """Evalua si la hora actual esta dentro de la ventana permitida."""
+        if not self.auto_capture_schedule_enforced:
+            return True
+
+        current = now or datetime.now()
+        hour = int(current.hour)
+        start_h = int(self.auto_capture_allowed_start_hour)
+        end_h = int(self.auto_capture_allowed_end_hour)
+
+        if start_h == end_h:
+            return True
+        if start_h < end_h:
+            return start_h <= hour < end_h
+        return hour >= start_h or hour < end_h
+
+    def _auto_capture_window_label(self) -> str:
+        return f"{int(self.auto_capture_allowed_start_hour):02d}:00-{int(self.auto_capture_allowed_end_hour):02d}:00"
+
+    def _set_auto_capture_runtime_state(self, enabled: bool, announce: bool = True, reason: str = "") -> None:
+        """Cambia solo el estado operativo de auto-captura y su UI."""
+        enabled = bool(enabled)
+        if self.auto_capture_enabled == enabled and not reason:
+            return
+
+        self.auto_capture_enabled = enabled
+
+        if hasattr(self, 'btn_auto_capture'):
+            self.btn_auto_capture.setChecked(enabled)
+
+            if enabled:
+                btn_class = "success"
+                icon_name = "fa5s.stop"
+                self.btn_auto_capture.setText(" Detener Auto-Captura")
+            else:
+                btn_class = "secondary"
+                icon_name = "fa5s.play"
+                self.btn_auto_capture.setText(" Iniciar Auto-Captura")
+
+            self.btn_auto_capture._icon_name = icon_name
+            self.btn_auto_capture._icon_class = btn_class
+            self.btn_auto_capture.setProperty("class", btn_class)
+
+            icon_color = self._btn_text_colors.get(btn_class, "#ffffff")
+            self.btn_auto_capture.setIcon(qta.icon(icon_name, color=icon_color))
+            self.btn_auto_capture.setIconSize(QSize(18, 18))
+            self.btn_auto_capture.style().unpolish(self.btn_auto_capture)
+            self.btn_auto_capture.style().polish(self.btn_auto_capture)
+            self.btn_auto_capture.update()
+
+        if enabled:
+            logger.info("Auto-captura habilitada.")
+            if announce and hasattr(self, 'status_bar'):
+                self.status_bar.set_status("Detección IA activa: Buscando ejemplares...", "success")
+        else:
+            self.processing_lock = False
+            if reason:
+                logger.info(f"Auto-captura deshabilitada: {reason}")
+            else:
+                logger.info("Auto-captura deshabilitada.")
+            if announce and hasattr(self, 'status_bar'):
+                msg = "Monitoreo automático pausado"
+                state = "warning"
+                if reason:
+                    msg = reason
+                    state = "info" if "horario" in reason.lower() else "warning"
+                self.status_bar.set_status(msg, state)
+
+    def _apply_auto_capture_policy(self, user_requested: bool, show_feedback: bool = True) -> None:
+        """Aplica la politica horaria respetando la intencion del operario."""
+        self.auto_capture_last_user_intent = bool(user_requested)
+
+        if not self.auto_capture_last_user_intent:
+            self._set_auto_capture_runtime_state(False, announce=show_feedback)
+            return
+
+        if self._is_within_auto_capture_window():
+            self._set_auto_capture_runtime_state(True, announce=show_feedback)
+            return
+
+        self._set_auto_capture_runtime_state(
+            False,
+            announce=show_feedback,
+            reason=f"Auto-captura fuera de horario ({self._auto_capture_window_label()})",
+        )
+
+    def _enforce_auto_capture_schedule(self, force_ui_sync: bool = False) -> None:
+        """Pausa/reanuda auto-captura en cambios de horario sin perder intencion del usuario."""
+        desired = bool(self.auto_capture_last_user_intent)
+        allowed_now = self._is_within_auto_capture_window()
+
+        if desired and allowed_now:
+            if force_ui_sync or not self.auto_capture_enabled:
+                self._set_auto_capture_runtime_state(True, announce=force_ui_sync)
+        elif desired and not allowed_now:
+            if force_ui_sync or self.auto_capture_enabled:
+                self._set_auto_capture_runtime_state(
+                    False,
+                    announce=True,
+                    reason=f"Auto-captura fuera de horario ({self._auto_capture_window_label()})",
+                )
+        else:
+            if force_ui_sync and self.auto_capture_enabled:
+                self._set_auto_capture_runtime_state(False, announce=False)
     
     def toggle_auto_capture(self, checked):
         """Activa/desactiva la captura automática con feedback visual e iconos sincronizados con el texto."""
+        if (
+            bool(checked)
+            and self.auto_capture_last_user_intent
+            and not self.auto_capture_enabled
+            and self.auto_capture_schedule_enforced
+            and not self._is_within_auto_capture_window()
+        ):
+            self._apply_auto_capture_policy(False, show_feedback=True)
+            self.status_bar.set_status("Reanudación programada cancelada por el operario", "warning")
+            return
 
-        self.auto_capture_enabled = checked
-
-        if checked:
-            btn_class = "success"
-            icon_name = "fa5s.stop"
-
-            self.btn_auto_capture.setText(" Detener Auto-Captura")
-            self.status_bar.set_status(
-                "Detección IA activa: Buscando ejemplares...",
-                "success"
-            )
-            logger.info("Auto-captura habilitada.")
-
-        else:
-            btn_class = "secondary"
-            icon_name = "fa5s.play"
-
-            self.btn_auto_capture.setText(" Iniciar Auto-Captura")
-            self.status_bar.set_status(
-                "Monitoreo automático pausado",
-                "warning"
-            )
-            self.processing_lock = False
-            logger.info("Auto-captura deshabilitada.")
-
-        # Guardar metadatos correctos para refresco en cambio de tema
-        self.btn_auto_capture._icon_name = icon_name
-        self.btn_auto_capture._icon_class = btn_class
-
-        # Aplicar clase visual
-        self.btn_auto_capture.setProperty("class", btn_class)
-
-        # Obtener color según clase actual
-        icon_color = self._btn_text_colors.get(btn_class, "#ffffff")
-
-        # Generar icono con color correcto
-        self.btn_auto_capture.setIcon(
-            qta.icon(icon_name, color=icon_color)
-        )
-        self.btn_auto_capture.setIconSize(QSize(18, 18))
-
-        # Refrescar estilos
-        self.btn_auto_capture.style().unpolish(self.btn_auto_capture)
-        self.btn_auto_capture.style().polish(self.btn_auto_capture)
-        self.btn_auto_capture.update()
+        self._apply_auto_capture_policy(bool(checked), show_feedback=True)
     
     def delete_selected_measurement(self):
         """Elimina de forma segura la medición seleccionada y su evidencia fotográfica"""
@@ -7908,8 +8639,9 @@ QPushButton[class="info"] {{
         measurements = self.db.get_filtered_measurements(limit=2000)
         
         if not measurements:
-            if hasattr(self, 'stats_text'):
-                self.stats_text.setHtml("<h3 style='color:#e74c3c; text-align:center;'>⚠️ No hay registros para analizar.</h3>")
+            self._render_statistics_empty_state(
+                "Aún no hay registros almacenados en la base de datos. El panel se mantendrá como guía hasta que exista la primera medición."
+            )
             return
 
         self.current_stats_data = self._build_statistics_dataset(measurements)
@@ -7920,7 +8652,9 @@ QPushButton[class="info"] {{
             self.current_stats_data['heights'],
             self.current_stats_data['widths'],
         ]):
-            self.stats_text.setHtml("<h3 style='text-align:center;'>No hay mediciones válidas para construir estadísticas confiables.</h3>")
+            self._render_statistics_empty_state(
+                "Hay registros, pero todavía no contienen suficientes medidas válidas para construir un reporte confiable."
+            )
             if hasattr(self, 'status_bar'):
                 self.status_bar.set_status("No hay mediciones válidas para estadísticas", "warning")
             return
@@ -7933,7 +8667,9 @@ QPushButton[class="info"] {{
         
     def update_report_html(self):
         """Genera un reporte con diseño de Dashboard Corporativo"""
-        if not hasattr(self, 'current_stats_data'): return
+        if not hasattr(self, 'current_stats_data'):
+            self._render_statistics_empty_state()
+            return
 
         d = self.current_stats_data
         style = self.report_style
@@ -8435,6 +9171,22 @@ QPushButton[class="info"] {{
         Config.CONFIDENCE_THRESHOLD = self.spin_confidence.value()
         Config.MIN_LENGTH_CM = self.spin_min_length.value()
         Config.MAX_LENGTH_CM = self.spin_max_length.value()
+        Config.TROUT_DENSITY = float(self.spin_trout_density.value())
+        Config.FORM_FACTOR = float(self.spin_form_factor.value())
+        Config.WEIGHT_K = float(self.spin_weight_k.value())
+        Config.WEIGHT_EXP = float(self.spin_weight_exp.value())
+        Config.WEIGHT_GLOBAL_BIAS = float(self.spin_weight_global_bias.value())
+        Config.ALEVIN_THRESHOLD_CM = float(self.spin_alevin_threshold.value())
+        Config.LENGTH_CORRECTION_FACTOR = float(self.spin_length_corr.value())
+        Config.HEIGHT_CORRECTION_FACTOR = float(self.spin_height_corr.value())
+        Config.WIDTH_CORRECTION_FACTOR = float(self.spin_width_corr.value())
+        Config.WEIGHT_CORRECTION_FACTOR = float(self.spin_weight_corr.value())
+
+        self.auto_capture_schedule_enforced = bool(self.chk_auto_capture_schedule.isChecked())
+        self.auto_capture_allowed_start_hour = int(self.spin_auto_capture_start.value())
+        self.auto_capture_allowed_end_hour = int(self.spin_auto_capture_end.value())
+        self.sensor_bar_refresh_seconds = int(self.spin_sensor_refresh_seconds.value())
+        self.sensor_top_bar_visible = bool(self.btn_toggle_sensor_top_bar.isChecked())
 
         # 2. Preparar Diccionarios para JSON y BD
         hsv_left = {
@@ -8448,6 +9200,12 @@ QPushButton[class="info"] {{
             's_min': self.spin_sat_min_top.value(), 's_max': self.spin_sat_max_top.value(),
             'v_min': self.spin_val_min_top.value(), 'v_max': self.spin_val_max_top.value()
         }
+
+        selected_profile = self.combo_species_profile.currentText().strip() if hasattr(self, 'combo_species_profile') else ""
+        if selected_profile and selected_profile in self.species_profiles:
+            self.active_species_profile_name = selected_profile
+            if not self._is_base_profile(selected_profile):
+                self.species_profiles[selected_profile] = self._collect_species_profile_snapshot_from_ui()
 
         config_data = {
             'cam_left_index': Config.CAM_LEFT_INDEX,
@@ -8470,7 +9228,33 @@ QPushButton[class="info"] {{
             },
             'quick_notes': self.quick_notes,
             'hsv_left': hsv_left,  
-            'hsv_top': hsv_top
+            'hsv_top': hsv_top,
+            'advanced_bio': {
+                'trout_density': Config.TROUT_DENSITY,
+                'form_factor': Config.FORM_FACTOR,
+                'weight_k': Config.WEIGHT_K,
+                'weight_exp': Config.WEIGHT_EXP,
+                'weight_global_bias': Config.WEIGHT_GLOBAL_BIAS,
+                'alevin_threshold_cm': Config.ALEVIN_THRESHOLD_CM,
+                'length_correction_factor': Config.LENGTH_CORRECTION_FACTOR,
+                'height_correction_factor': Config.HEIGHT_CORRECTION_FACTOR,
+                'width_correction_factor': Config.WIDTH_CORRECTION_FACTOR,
+                'weight_correction_factor': Config.WEIGHT_CORRECTION_FACTOR,
+            },
+            'species_profiles': self.species_profiles,
+            'active_species_profile': self.active_species_profile_name,
+            'auto_capture_schedule': {
+                'enabled': self.auto_capture_schedule_enforced,
+                'start_hour': self.auto_capture_allowed_start_hour,
+                'end_hour': self.auto_capture_allowed_end_hour,
+                'last_user_intent': self.auto_capture_last_user_intent,
+                'keep_across_tabs': self.auto_capture_keep_across_tabs,
+            },
+            'sensor_bar_refresh_seconds': self.sensor_bar_refresh_seconds,
+            'sensor_top_bar_visible': self.sensor_top_bar_visible,
+            'ui_behavior': {
+                'start_fullscreen_on_launch': self.start_fullscreen_on_launch,
+            }
         }
         
         # Guardar en BD
@@ -8487,6 +9271,8 @@ QPushButton[class="info"] {{
         try:
             with open(Config.CONFIG_FILE, 'w') as f:
                 json.dump(config_data, f, indent=4)
+
+            self._enforce_auto_capture_schedule(force_ui_sync=True)
             
             self.status_bar.set_status("Configuración guardada en disco y BD", "success")
             self._set_settings_dirty(False)
@@ -8519,6 +9305,9 @@ QPushButton[class="info"] {{
         except Exception as e:
             logger.warning(f"No se pudo acceder a la BD para calibración: {e}")
 
+        if self.active_species_profile_name and self.active_species_profile_name in self.species_profiles:
+            self._apply_species_profile_to_state(self.species_profiles[self.active_species_profile_name])
+
     def _load_base_values(self):
         """Inicializa las variables internas con valores seguros de Config.py"""
         # Escalas base
@@ -8539,6 +9328,21 @@ QPushButton[class="info"] {{
         self.hsv_top_h_min, self.hsv_top_h_max = self.hsv_left_h_min, self.hsv_left_h_max
         self.hsv_top_s_min, self.hsv_top_s_max = self.hsv_left_s_min, self.hsv_left_s_max
         self.hsv_top_v_min, self.hsv_top_v_max = self.hsv_left_v_min, self.hsv_left_v_max
+
+        # Auto-captura horaria base
+        self.auto_capture_keep_across_tabs = True
+        self.auto_capture_schedule_enforced = True
+        self.auto_capture_allowed_start_hour = 6
+        self.auto_capture_allowed_end_hour = 18
+        self.start_fullscreen_on_launch = True
+        self.sensor_bar_refresh_seconds = 2
+        self.sensor_top_bar_visible = True
+
+        if not self.species_profiles:
+            self.species_profiles = self._build_default_species_profiles()
+            self.active_species_profile_name = "Base - Trucha Juvenil"
+        else:
+            self._ensure_base_species_profiles()
         
         logger.info("Valores base inicializados desde memoria.")
         
@@ -8568,6 +9372,15 @@ QPushButton[class="info"] {{
             self.spin_env_cond_min, self.spin_env_cond_max,
             self.spin_env_turb_min, self.spin_env_turb_max,
             self.spin_env_do_min, self.spin_env_do_max,
+            self.spin_trout_density, self.spin_form_factor,
+            self.spin_weight_k, self.spin_weight_exp,
+            self.spin_weight_global_bias, self.spin_alevin_threshold,
+            self.spin_length_corr, self.spin_height_corr,
+            self.spin_width_corr, self.spin_weight_corr,
+            self.spin_auto_capture_start, self.spin_auto_capture_end,
+            self.chk_auto_capture_schedule,
+            self.chk_auto_capture_keep_tabs,
+            self.chk_start_fullscreen,
         ]
 
         for w in widgets_to_sync:
@@ -8616,9 +9429,36 @@ QPushButton[class="info"] {{
             self.spin_env_turb_max.setValue(self.sensor_env_ranges["turb"][1])
             self.spin_env_do_min.setValue(self.sensor_env_ranges["do"][0])
             self.spin_env_do_max.setValue(self.sensor_env_ranges["do"][1])
+            self.spin_sensor_refresh_seconds.setValue(int(self.sensor_bar_refresh_seconds))
+
+            # --- Parametros Biologicos Avanzados ---
+            self.spin_trout_density.setValue(float(Config.TROUT_DENSITY))
+            self.spin_form_factor.setValue(float(Config.FORM_FACTOR))
+            self.spin_weight_k.setValue(float(Config.WEIGHT_K))
+            self.spin_weight_exp.setValue(float(Config.WEIGHT_EXP))
+            self.spin_weight_global_bias.setValue(float(Config.WEIGHT_GLOBAL_BIAS))
+            self.spin_alevin_threshold.setValue(float(Config.ALEVIN_THRESHOLD_CM))
+            self.spin_length_corr.setValue(float(Config.LENGTH_CORRECTION_FACTOR))
+            self.spin_height_corr.setValue(float(Config.HEIGHT_CORRECTION_FACTOR))
+            self.spin_width_corr.setValue(float(Config.WIDTH_CORRECTION_FACTOR))
+            self.spin_weight_corr.setValue(float(Config.WEIGHT_CORRECTION_FACTOR))
+
+            # --- Horario Auto-Captura ---
+            self.chk_auto_capture_schedule.setChecked(bool(self.auto_capture_schedule_enforced))
+            self.spin_auto_capture_start.setValue(int(self.auto_capture_allowed_start_hour))
+            self.spin_auto_capture_end.setValue(int(self.auto_capture_allowed_end_hour))
+            self.chk_auto_capture_keep_tabs.setChecked(bool(self.auto_capture_keep_across_tabs))
+            self.chk_start_fullscreen.setChecked(bool(self.start_fullscreen_on_launch))
+            if hasattr(self, 'btn_tablet_mode'):
+                self.btn_tablet_mode.setChecked(bool(self.tablet_mode_enabled))
+            self.btn_toggle_sensor_top_bar.setChecked(bool(self.sensor_top_bar_visible))
 
             self._apply_sensor_ranges_from_ui()
+            self._apply_sensor_refresh_interval_from_ui()
+            self.toggle_sensor_top_bar_visibility(self.sensor_top_bar_visible)
             self._refresh_quick_note_combos()
+            self._refresh_species_profile_combo()
+            self.on_auto_capture_schedule_changed()
 
             self.status_bar.set_status("Interfaz sincronizada con éxito", "success")
             self._set_settings_dirty(False)
@@ -8688,6 +9528,58 @@ QPushButton[class="info"] {{
                         parsed_notes.append(clean)
                 if parsed_notes:
                     self.quick_notes = parsed_notes[:25]
+
+            # 7. Parametros biologicos avanzados
+            adv_bio = data.get('advanced_bio')
+            if isinstance(adv_bio, dict):
+                Config.TROUT_DENSITY = float(adv_bio.get('trout_density', Config.TROUT_DENSITY))
+                Config.FORM_FACTOR = float(adv_bio.get('form_factor', Config.FORM_FACTOR))
+                Config.WEIGHT_K = float(adv_bio.get('weight_k', Config.WEIGHT_K))
+                Config.WEIGHT_EXP = float(adv_bio.get('weight_exp', Config.WEIGHT_EXP))
+                Config.WEIGHT_GLOBAL_BIAS = float(adv_bio.get('weight_global_bias', Config.WEIGHT_GLOBAL_BIAS))
+                Config.ALEVIN_THRESHOLD_CM = float(adv_bio.get('alevin_threshold_cm', Config.ALEVIN_THRESHOLD_CM))
+                Config.LENGTH_CORRECTION_FACTOR = float(adv_bio.get('length_correction_factor', Config.LENGTH_CORRECTION_FACTOR))
+                Config.HEIGHT_CORRECTION_FACTOR = float(adv_bio.get('height_correction_factor', Config.HEIGHT_CORRECTION_FACTOR))
+                Config.WIDTH_CORRECTION_FACTOR = float(adv_bio.get('width_correction_factor', Config.WIDTH_CORRECTION_FACTOR))
+                Config.WEIGHT_CORRECTION_FACTOR = float(adv_bio.get('weight_correction_factor', Config.WEIGHT_CORRECTION_FACTOR))
+
+            # 8. Politica horaria auto-captura
+            schedule = data.get('auto_capture_schedule')
+            if isinstance(schedule, dict):
+                self.auto_capture_schedule_enforced = bool(schedule.get('enabled', self.auto_capture_schedule_enforced))
+                self.auto_capture_allowed_start_hour = int(schedule.get('start_hour', self.auto_capture_allowed_start_hour))
+                self.auto_capture_allowed_end_hour = int(schedule.get('end_hour', self.auto_capture_allowed_end_hour))
+                self.auto_capture_last_user_intent = bool(schedule.get('last_user_intent', self.auto_capture_last_user_intent))
+                self.auto_capture_keep_across_tabs = bool(schedule.get('keep_across_tabs', self.auto_capture_keep_across_tabs))
+
+            ui_behavior = data.get('ui_behavior')
+            if isinstance(ui_behavior, dict):
+                self.start_fullscreen_on_launch = bool(
+                    ui_behavior.get('start_fullscreen_on_launch', self.start_fullscreen_on_launch)
+                )
+
+            self.sensor_bar_refresh_seconds = max(1, int(data.get('sensor_bar_refresh_seconds', self.sensor_bar_refresh_seconds)))
+            self.sensor_top_bar_visible = bool(data.get('sensor_top_bar_visible', self.sensor_top_bar_visible))
+
+            # 9. Perfiles por especie/etapa
+            raw_profiles = data.get('species_profiles')
+            if isinstance(raw_profiles, dict):
+                clean_profiles = {}
+                for name, profile in raw_profiles.items():
+                    clean_name = self._normalize_note_text(name)
+                    if clean_name and isinstance(profile, dict):
+                        clean_profiles[clean_name] = profile
+                if clean_profiles:
+                    self.species_profiles = clean_profiles
+
+            self._ensure_base_species_profiles()
+
+            selected_profile = self._normalize_note_text(data.get('active_species_profile', ''))
+            if selected_profile and selected_profile in self.species_profiles:
+                self.active_species_profile_name = selected_profile
+                self._apply_species_profile_to_state(self.species_profiles[selected_profile])
+            elif not self.active_species_profile_name and self.species_profiles:
+                self.active_species_profile_name = sorted(self.species_profiles.keys())[0]
             
         except Exception as e:
             logger.error(f"Error parseando JSON: {e}")                

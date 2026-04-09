@@ -65,7 +65,6 @@ class SensorTopBar(QWidget):
         self.btn_tablet.setProperty("icon_name", "fa5s.tablet-alt")
         self.btn_tablet.setProperty("state", "info")
         self._refresh_icon_color(self.btn_tablet)
-        self.layout_main.addWidget(self.btn_tablet)
         self.set_visual_density()
 
         self.blink_timer = QTimer(self)
