@@ -2,11 +2,12 @@
 PROYECTO: FishTrace - Trazabilidad de Crecimiento de Peces
 MÓDULO: Gestión de Persistencia (DatabaseManager.py)
 DESCRIPCIÓN: Administra la base de datos SQLite, manejando el ciclo de vida de los datos,
-             migraciones de esquema, índices de rendimiento y consultas biométricas.
+            migraciones de esquema, índices de rendimiento y consultas biométricas.
 """
 
 import sqlite3
 import os
+import csv
 from datetime import datetime
 from typing import Optional, Dict, List, Tuple, Any
 import logging
@@ -26,7 +27,8 @@ MEASUREMENT_COLUMNS = (
 
     'api_air_temp_c', 'api_water_temp_c', 
     'api_rel_humidity', 'api_abs_humidity_g_m3',
-    'api_ph', 'api_cond_us_cm', 'api_do_mg_l', 'api_turbidity_ntu'
+    'api_ph', 'api_cond_us_cm', 'api_do_mg_l', 'api_turbidity_ntu',
+    'batch_id'
 )
 
 MEASUREMENT_COLUMNS_STR = ', '.join(MEASUREMENT_COLUMNS)
@@ -92,7 +94,8 @@ class DatabaseManager:
                 api_ph REAL,
                 api_cond_us_cm REAL,
                 api_do_mg_l REAL, 
-                api_turbidity_ntu REAL
+                api_turbidity_ntu REAL,
+                batch_id TEXT
             )
         ''')
         
@@ -166,7 +169,8 @@ class DatabaseManager:
             'api_ph': 'REAL',
             'api_cond_us_cm': 'REAL',
             'api_do_mg_l': 'REAL',
-            'api_turbidity_ntu': 'REAL'
+            'api_turbidity_ntu': 'REAL',
+            'batch_id': 'TEXT'
         }
         
         cursor.execute("PRAGMA table_info(measurements)")
@@ -180,6 +184,18 @@ class DatabaseManager:
                 except sqlite3.OperationalError as e:
                     logger.error(f"Error migrando measurements ({col_name}): {e}.")
 
+        # Compatibilidad: todo registro histórico sin tanda pasa a TANDA_1.
+        try:
+            cursor.execute(
+                """
+                UPDATE measurements
+                SET batch_id = 'TANDA_1'
+                WHERE batch_id IS NULL OR trim(batch_id) = ''
+                """
+            )
+        except sqlite3.OperationalError as e:
+            logger.error(f"Error aplicando backfill de tanda historica: {e}")
+
         conn.commit()
         self._column_cache = None
 
@@ -188,7 +204,8 @@ class DatabaseManager:
         indexes = [
             "CREATE INDEX IF NOT EXISTS idx_timestamp ON measurements(timestamp DESC)",
             "CREATE INDEX IF NOT EXISTS idx_fish_id ON measurements(fish_id)",
-            "CREATE INDEX IF NOT EXISTS idx_measurement_type ON measurements(measurement_type)"
+            "CREATE INDEX IF NOT EXISTS idx_measurement_type ON measurements(measurement_type)",
+            "CREATE INDEX IF NOT EXISTS idx_batch_id ON measurements(batch_id)"
         ]
         for idx_query in indexes:
             try:
@@ -215,8 +232,8 @@ class DatabaseManager:
              lat_area_cm2, top_area_cm2, volume_cm3, 
              confidence_score, notes, image_path, measurement_type, validation_errors,
              api_air_temp_c, api_water_temp_c, api_rel_humidity, 
-             api_abs_humidity_g_m3, api_ph, api_cond_us_cm, api_do_mg_l, api_turbidity_ntu)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+             api_abs_humidity_g_m3, api_ph, api_cond_us_cm, api_do_mg_l, api_turbidity_ntu, batch_id)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ''', (
             data.get('timestamp', datetime.now().isoformat()),
             data.get('fish_id', ''), 
@@ -247,7 +264,8 @@ class DatabaseManager:
             data.get('api_ph', 0),
             data.get('api_cond_us_cm', 0),
             data.get('api_do_mg_l', 0),
-            data.get('api_turbidity_ntu', 0)
+            data.get('api_turbidity_ntu', 0),
+            data.get('batch_id', '')
         ))
         
         conn.commit()
@@ -299,7 +317,8 @@ class DatabaseManager:
                 lat_area_cm2 = ?, top_area_cm2 = ?, volume_cm3 = ?,
                 notes = ?, measurement_type = ?, validation_errors = ?,
                 api_air_temp_c = ?, api_water_temp_c = ?, api_rel_humidity = ?,
-                api_abs_humidity_g_m3 = ?, api_ph = ?, api_cond_us_cm = ?, api_do_mg_l = ?, api_turbidity_ntu = ?
+                api_abs_humidity_g_m3 = ?, api_ph = ?, api_cond_us_cm = ?, api_do_mg_l = ?, api_turbidity_ntu = ?,
+                batch_id = ?
             WHERE id = ?
         ''', (
             data.get('timestamp', ''),
@@ -330,6 +349,7 @@ class DatabaseManager:
             data.get('api_cond_us_cm', 0),
             data.get('api_do_mg_l', 0),
             data.get('api_turbidity_ntu', 0),
+            data.get('batch_id', ''),
             
             measurement_id
         ))
@@ -381,6 +401,8 @@ class DatabaseManager:
         offset: int = 0, 
         search_query: Optional[str] = None, 
         filter_type: Optional[str] = None, 
+        batch_id: Optional[str] = None,
+        excluded_batch_ids: Optional[List[str]] = None,
         date_start: Optional[str] = None, 
         date_end: Optional[str] = None
     ) -> List[Tuple]:
@@ -392,6 +414,8 @@ class DatabaseManager:
             where_clause, params = self._build_measurements_filters(
                 search_query=search_query,
                 filter_type=filter_type,
+                batch_id=batch_id,
+                excluded_batch_ids=excluded_batch_ids,
                 date_start=date_start,
                 date_end=date_end,
             )
@@ -416,6 +440,8 @@ class DatabaseManager:
         self,
         search_query: Optional[str] = None,
         filter_type: Optional[str] = None,
+        batch_id: Optional[str] = None,
+        excluded_batch_ids: Optional[List[str]] = None,
         date_start: Optional[str] = None,
         date_end: Optional[str] = None,
     ) -> int:
@@ -427,6 +453,8 @@ class DatabaseManager:
             where_clause, params = self._build_measurements_filters(
                 search_query=search_query,
                 filter_type=filter_type,
+                batch_id=batch_id,
+                excluded_batch_ids=excluded_batch_ids,
                 date_start=date_start,
                 date_end=date_end,
             )
@@ -446,6 +474,8 @@ class DatabaseManager:
         self,
         search_query: Optional[str] = None,
         filter_type: Optional[str] = None,
+        batch_id: Optional[str] = None,
+        excluded_batch_ids: Optional[List[str]] = None,
         date_start: Optional[str] = None,
         date_end: Optional[str] = None,
     ) -> Dict[str, Any]:
@@ -457,6 +487,8 @@ class DatabaseManager:
             where_clause, params = self._build_measurements_filters(
                 search_query=search_query,
                 filter_type=filter_type,
+                batch_id=batch_id,
+                excluded_batch_ids=excluded_batch_ids,
                 date_start=date_start,
                 date_end=date_end,
             )
@@ -508,6 +540,8 @@ class DatabaseManager:
         self,
         search_query: Optional[str] = None,
         filter_type: Optional[str] = None,
+        batch_id: Optional[str] = None,
+        excluded_batch_ids: Optional[List[str]] = None,
         date_start: Optional[str] = None,
         date_end: Optional[str] = None,
     ) -> Tuple[str, List[Any]]:
@@ -518,6 +552,17 @@ class DatabaseManager:
         if filter_type and filter_type not in ["Todas", "Todos", None]:
             query += " AND measurement_type = ?"
             params.append(filter_type)
+
+        if batch_id and batch_id not in ["Todas", "Todos", None, ""]:
+            query += " AND COALESCE(batch_id, '') = ?"
+            params.append(batch_id)
+
+        if excluded_batch_ids:
+            cleaned = [b for b in excluded_batch_ids if b and b not in ["Todas", "Todos"]]
+            if cleaned:
+                placeholders = ", ".join(["?" for _ in cleaned])
+                query += f" AND COALESCE(batch_id, '') NOT IN ({placeholders})"
+                params.extend(cleaned)
 
         if date_start:
             query += " AND date(timestamp) >= date(?)"
@@ -631,26 +676,247 @@ class DatabaseManager:
             logger.error(f"Error reconstruyendo cache de columnas: {e}")
             self._column_cache = {}
             
-    def get_next_fish_number(self) -> int:
+    def get_next_fish_number(self, batch_id: Optional[str] = None) -> int:
             """
             Calcula el siguiente número secuencial para el ID del pez 
             basado en los registros del día actual.
             """
             try:
-
-                today_str = datetime.now().strftime('%Y-%m-%d')
                 
                 with sqlite3.connect(self.db_path) as conn:
                     cursor = conn.cursor()
-  
-                    query = "SELECT COUNT(*) FROM measurements WHERE timestamp LIKE ?"
-                    cursor.execute(query, (f"{today_str}%",))
+
+                    if batch_id:
+                        query = "SELECT COUNT(*) FROM measurements WHERE COALESCE(batch_id, '') = ?"
+                        cursor.execute(query, (batch_id,))
+                    else:
+                        today_str = datetime.now().strftime('%Y-%m-%d')
+                        query = "SELECT COUNT(*) FROM measurements WHERE timestamp LIKE ?"
+                        cursor.execute(query, (f"{today_str}%",))
                     
                     count = cursor.fetchone()[0]
                     return count + 1
             except Exception as e:
                 logger.error(f"Error calculando siguiente ID secuencial: {e}")
                 return 1 
+
+    def get_distinct_batches(self) -> List[str]:
+        """Retorna las tandas existentes ordenadas por uso reciente."""
+        try:
+            with sqlite3.connect(self.db_path) as conn:
+                cursor = conn.cursor()
+                cursor.execute(
+                    """
+                    SELECT COALESCE(batch_id, '') AS batch_id, MAX(timestamp) AS last_ts
+                    FROM measurements
+                    GROUP BY COALESCE(batch_id, '')
+                    HAVING batch_id <> ''
+                    ORDER BY last_ts DESC
+                    """
+                )
+                rows = cursor.fetchall()
+                return [str(row[0]) for row in rows if row and row[0]]
+        except Exception as e:
+            logger.error(f"Error obteniendo tandas: {e}")
+            return []
+
+    def get_batch_summaries(self) -> List[Dict[str, Any]]:
+        """Obtiene resumen por tanda: cantidad y rango temporal."""
+        try:
+            with sqlite3.connect(self.db_path) as conn:
+                conn.row_factory = sqlite3.Row
+                cursor = conn.cursor()
+                cursor.execute(
+                    """
+                    SELECT
+                        COALESCE(batch_id, '') AS batch_id,
+                        COUNT(*) AS total,
+                        MIN(date(timestamp)) AS first_day,
+                        MAX(date(timestamp)) AS last_day,
+                        MAX(timestamp) AS last_ts
+                    FROM measurements
+                    GROUP BY COALESCE(batch_id, '')
+                    HAVING batch_id <> ''
+                    ORDER BY last_ts DESC
+                    """
+                )
+                rows = cursor.fetchall()
+                return [
+                    {
+                        "batch_id": str(row["batch_id"]),
+                        "total": int(row["total"] or 0),
+                        "first_day": row["first_day"],
+                        "last_day": row["last_day"],
+                    }
+                    for row in rows
+                ]
+        except Exception as e:
+            logger.error(f"Error obteniendo resumen de tandas: {e}")
+            return []
+
+    def rename_batch(self, old_batch_id: str, new_batch_id: str) -> int:
+        """Renombra una tanda existente."""
+        if not old_batch_id or not new_batch_id or old_batch_id == new_batch_id:
+            return 0
+        try:
+            with sqlite3.connect(self.db_path) as conn:
+                cursor = conn.cursor()
+                cursor.execute(
+                    """
+                    UPDATE measurements
+                    SET batch_id = ?
+                    WHERE COALESCE(batch_id, '') = ?
+                    """,
+                    (new_batch_id, old_batch_id),
+                )
+                conn.commit()
+                return int(cursor.rowcount or 0)
+        except Exception as e:
+            logger.error(f"Error renombrando tanda: {e}")
+            return 0
+
+    def assign_batch_by_date_range(self, batch_id: str, date_start: str, date_end: str) -> int:
+        """Asigna tanda a registros en rango de fechas [date_start, date_end]."""
+        if not batch_id or not date_start or not date_end:
+            return 0
+        try:
+            with sqlite3.connect(self.db_path) as conn:
+                cursor = conn.cursor()
+                cursor.execute(
+                    """
+                    UPDATE measurements
+                    SET batch_id = ?
+                    WHERE date(timestamp) >= date(?)
+                      AND date(timestamp) <= date(?)
+                    """,
+                    (batch_id, date_start, date_end),
+                )
+                conn.commit()
+                return int(cursor.rowcount or 0)
+        except Exception as e:
+            logger.error(f"Error asignando tanda por rango: {e}")
+            return 0
+
+    def delete_batch(self, batch_id: str, replacement_batch_id: str = "TANDA_1") -> int:
+        """Elimina una tanda reasignando sus registros a otra tanda segura."""
+        if not batch_id or batch_id == replacement_batch_id:
+            return 0
+        try:
+            with sqlite3.connect(self.db_path) as conn:
+                cursor = conn.cursor()
+                cursor.execute(
+                    """
+                    UPDATE measurements
+                    SET batch_id = ?
+                    WHERE COALESCE(batch_id, '') = ?
+                    """,
+                    (replacement_batch_id, batch_id),
+                )
+                conn.commit()
+                return int(cursor.rowcount or 0)
+        except Exception as e:
+            logger.error(f"Error eliminando tanda: {e}")
+            return 0
             
     def invalidate_cache(self) -> None:
         self._column_cache = None
+
+    def reset_measurements_cycle(
+        self,
+        backup_dir: Optional[str] = None,
+        delete_images: bool = False,
+    ) -> Dict[str, Any]:
+        """
+        Reinicia una nueva tanda de mediciones de forma segura.
+
+        - Respalda la tabla `measurements` a CSV (si hay registros).
+        - Elimina registros de mediciones.
+        - Reinicia el AUTOINCREMENT de `measurements`.
+        - Opcionalmente elimina imágenes asociadas.
+
+        No toca calibraciones ni perfiles de especies.
+        """
+        summary: Dict[str, Any] = {
+            "success": False,
+            "total_before": 0,
+            "deleted_rows": 0,
+            "deleted_images": 0,
+            "backup_path": None,
+            "errors": [],
+        }
+
+        if backup_dir is None:
+            backup_dir = os.path.join("Resultados", "CSV", "Respaldos")
+
+        os.makedirs(backup_dir, exist_ok=True)
+
+        conn = sqlite3.connect(self.db_path)
+        conn.row_factory = sqlite3.Row
+
+        try:
+            cursor = conn.cursor()
+            cursor.execute("SELECT * FROM measurements ORDER BY timestamp ASC")
+            rows = cursor.fetchall()
+            summary["total_before"] = len(rows)
+
+            if not rows:
+                summary["success"] = True
+                return summary
+
+            image_paths: List[str] = []
+            if delete_images:
+                for row in rows:
+                    img = row["image_path"] if "image_path" in row.keys() else None
+                    if img:
+                        image_paths.append(str(img))
+
+            backup_name = f"backup_mediciones_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
+            backup_path = os.path.join(backup_dir, backup_name)
+
+            fieldnames = rows[0].keys()
+            with open(backup_path, "w", newline="", encoding="utf-8-sig") as f:
+                writer = csv.writer(f)
+                writer.writerow([str(name).upper() for name in fieldnames])
+                for row in rows:
+                    writer.writerow([row[name] for name in fieldnames])
+
+            summary["backup_path"] = backup_path
+
+            cursor.execute("BEGIN")
+            cursor.execute("DELETE FROM measurements")
+            summary["deleted_rows"] = cursor.rowcount if cursor.rowcount is not None else len(rows)
+
+            try:
+                cursor.execute("DELETE FROM sqlite_sequence WHERE name = 'measurements'")
+            except sqlite3.OperationalError:
+                # Algunos entornos SQLite no exponen sqlite_sequence en ciertas condiciones.
+                pass
+
+            conn.commit()
+
+            if delete_images:
+                for img_path in image_paths:
+                    try:
+                        abs_path = os.path.abspath(img_path)
+                        if os.path.exists(abs_path):
+                            os.remove(abs_path)
+                            summary["deleted_images"] += 1
+                    except Exception as e:
+                        summary["errors"].append(f"No se pudo eliminar imagen '{img_path}': {e}")
+
+            summary["success"] = True
+            logger.info(
+                "Reinicio de tanda completado | filas=%s | imagenes=%s | backup=%s",
+                summary["deleted_rows"],
+                summary["deleted_images"],
+                summary["backup_path"],
+            )
+            return summary
+
+        except Exception as e:
+            conn.rollback()
+            summary["errors"].append(str(e))
+            logger.error("Error al reiniciar tanda de mediciones: %s", e, exc_info=True)
+            return summary
+        finally:
+            conn.close()
