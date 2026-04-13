@@ -10,7 +10,7 @@ import time
 import requests
 from datetime import datetime
 from functools import wraps
-from flask import Flask, jsonify
+from flask import Flask, jsonify, request
 from flask_cors import CORS
 from pyngrok import ngrok, conf
 
@@ -82,6 +82,26 @@ class ApiService:
     # ================= ROUTES =================
     def _setup_routes(self):
 
+        def resolve_target_batch(cursor, requested_batch=None):
+            """Si no se especifica tanda, usa la más reciente por timestamp."""
+            if requested_batch:
+                return str(requested_batch).strip()
+
+            cursor.execute(
+                """
+                SELECT COALESCE(batch_id, '') AS batch_id
+                FROM measurements
+                ORDER BY timestamp DESC
+                LIMIT 1
+                """
+            )
+            row = cursor.fetchone()
+            if not row:
+                return None
+            value = row[0] if not isinstance(row, sqlite3.Row) else row["batch_id"]
+            value = str(value or '').strip()
+            return value or None
+
         def cached(timeout=60):
             def decorator(f):
                 @wraps(f)
@@ -136,12 +156,23 @@ class ApiService:
                     conn.row_factory = sqlite3.Row
                     cursor = conn.cursor()
 
-                    cursor.execute("""
+                    requested_batch = request.args.get('batch_id', type=str)
+                    target_batch = resolve_target_batch(cursor, requested_batch)
+                    if target_batch:
+                        scope_filter = "COALESCE(batch_id, '') = ?"
+                        scope_params = [target_batch]
+                    else:
+                        scope_filter = "1=1"
+                        scope_params = []
+
+                    query_last_day = f"""
                         SELECT substr(timestamp, 1, 10) as f
                         FROM measurements
-                        WHERE length_cm > 0 OR manual_length_cm > 0
+                        WHERE (length_cm > 0 OR manual_length_cm > 0)
+                          AND {scope_filter}
                         ORDER BY timestamp DESC LIMIT 1
-                    """)
+                    """
+                    cursor.execute(query_last_day, tuple(scope_params))
                     res = cursor.fetchone()
 
                     if not res:
@@ -153,34 +184,40 @@ class ApiService:
 
                     ultima_fecha = res['f']
 
-                    query = """
-                    SELECT 
-                        substr(timestamp, 1, 10) as fecha,
-                        COUNT(*) as total_muestras,
-
-                        ROUND(AVG(CASE WHEN manual_length_cm > 0 THEN manual_length_cm ELSE length_cm END), 2) as longitud_cm,
-                        ROUND(AVG(CASE WHEN manual_weight_g > 0 THEN manual_weight_g ELSE weight_g END), 2) as peso_g,
-                        ROUND(AVG(CASE WHEN manual_height_cm > 0 THEN manual_height_cm ELSE height_cm END), 2) as alto_cm,
-                        ROUND(AVG(CASE WHEN manual_width_cm > 0 THEN manual_width_cm ELSE width_cm END), 2) as ancho_cm,
-
-                        ROUND(AVG(lat_area_cm2), 2) as area_lateral_cm2,
-                        ROUND(AVG(top_area_cm2), 2) as area_cenital_cm2,
-                        ROUND(AVG(volume_cm3), 2) as volumen_cm3,
-
-                        ROUND(AVG(CASE WHEN api_air_temp_c > 0 THEN api_air_temp_c ELSE NULL END), 1) as temp_aire_c,
-                        ROUND(AVG(CASE WHEN api_water_temp_c > 0 THEN api_water_temp_c ELSE NULL END), 1) as temp_agua_c,
-                        ROUND(AVG(CASE WHEN api_ph > 0 THEN api_ph ELSE NULL END), 1) as ph,
-                        ROUND(AVG(CASE WHEN api_do_mg_l > 0 THEN api_do_mg_l ELSE NULL END), 1) as oxigeno_mg_l,
-                        ROUND(AVG(CASE WHEN api_rel_humidity > 0 THEN api_rel_humidity ELSE NULL END), 1) as humedad_rel,
-                        ROUND(AVG(CASE WHEN api_turbidity_ntu > 0 THEN api_turbidity_ntu ELSE NULL END), 1) as turbidez_ntu,
-                        ROUND(AVG(CASE WHEN api_cond_us_cm > 0 THEN api_cond_us_cm ELSE NULL END), 1) as conductividad_us
-
-                    FROM measurements 
-                    WHERE substr(timestamp, 1, 10) = ?
+                    query = f"""
+                        SELECT 
+                            substr(timestamp, 1, 10) as fecha,
+                            COUNT(*) as total_muestras,
+                            ROUND(AVG(CASE WHEN manual_length_cm > 0 THEN manual_length_cm ELSE length_cm END), 2) as longitud_cm,
+                            ROUND(AVG(CASE WHEN manual_weight_g > 0 THEN manual_weight_g ELSE weight_g END), 2) as peso_g,
+                            ROUND(AVG(CASE WHEN manual_height_cm > 0 THEN manual_height_cm ELSE height_cm END), 2) as alto_cm,
+                            ROUND(AVG(CASE WHEN manual_width_cm > 0 THEN manual_width_cm ELSE width_cm END), 2) as ancho_cm,
+                            ROUND(AVG(lat_area_cm2), 2) as area_lateral_cm2,
+                            ROUND(AVG(top_area_cm2), 2) as area_cenital_cm2,
+                            ROUND(AVG(volume_cm3), 2) as volumen_cm3,
+                            ROUND(AVG(CASE WHEN api_air_temp_c > 0 THEN api_air_temp_c ELSE NULL END), 1) as temp_aire_c,
+                            ROUND(AVG(CASE WHEN api_water_temp_c > 0 THEN api_water_temp_c ELSE NULL END), 1) as temp_agua_c,
+                            ROUND(AVG(CASE WHEN api_ph > 0 THEN api_ph ELSE NULL END), 1) as ph,
+                            ROUND(AVG(CASE WHEN api_do_mg_l > 0 THEN api_do_mg_l ELSE NULL END), 1) as oxigeno_mg_l,
+                            ROUND(AVG(CASE WHEN api_rel_humidity > 0 THEN api_rel_humidity ELSE NULL END), 1) as humedad_rel,
+                            ROUND(AVG(CASE WHEN api_turbidity_ntu > 0 THEN api_turbidity_ntu ELSE NULL END), 1) as turbidez_ntu,
+                            ROUND(AVG(CASE WHEN api_cond_us_cm > 0 THEN api_cond_us_cm ELSE NULL END), 1) as conductividad_us
+                        FROM measurements
+                        WHERE substr(timestamp, 1, 10) = ?
+                          AND {scope_filter}
                     """
-
-                    cursor.execute(query, (ultima_fecha,))
+                    cursor.execute(query, tuple([ultima_fecha] + scope_params))
                     reporte = cursor.fetchone()
+
+                    query_range = f"""
+                        SELECT MIN(substr(timestamp, 1, 10)) AS primera,
+                               MAX(substr(timestamp, 1, 10)) AS ultima
+                        FROM measurements
+                        WHERE (length_cm > 0 OR manual_length_cm > 0)
+                          AND {scope_filter}
+                    """
+                    cursor.execute(query_range, tuple(scope_params))
+                    rango = cursor.fetchone()
 
                 # ← Snapshot seguro de los sensores en vivo
                 with self._live_sensors_lock:
@@ -189,6 +226,9 @@ class ApiService:
                 data = {
                     "fecha": reporte["fecha"],
                     "total_muestras": reporte["total_muestras"],
+                    "batch_id": target_batch,
+                    "primera_medicion_tanda": rango["primera"] if rango else None,
+                    "ultima_medicion_tanda": rango["ultima"] if rango else None,
 
                     "biometria": {
                         "longitud_cm": reporte["longitud_cm"],
@@ -242,7 +282,16 @@ class ApiService:
                     conn.row_factory = sqlite3.Row
                     cursor = conn.cursor()
 
-                    cursor.execute("""
+                    requested_batch = request.args.get('batch_id', type=str)
+                    target_batch = resolve_target_batch(cursor, requested_batch)
+                    if target_batch:
+                        scope_filter = "COALESCE(batch_id, '') = ?"
+                        scope_params = [target_batch]
+                    else:
+                        scope_filter = "1=1"
+                        scope_params = []
+
+                    query_stats = f"""
                         SELECT 
                             COUNT(*) as total_mediciones,
                             COUNT(DISTINCT substr(timestamp, 1, 10)) as dias_activos,
@@ -251,14 +300,17 @@ class ApiService:
                             ROUND(AVG(CASE WHEN manual_length_cm > 0 THEN manual_length_cm ELSE length_cm END), 2) as longitud_promedio,
                             ROUND(AVG(CASE WHEN manual_weight_g > 0 THEN manual_weight_g ELSE weight_g END), 2) as peso_promedio
                         FROM measurements
-                        WHERE length_cm > 0 OR manual_length_cm > 0
-                    """)
+                        WHERE (length_cm > 0 OR manual_length_cm > 0)
+                          AND {scope_filter}
+                    """
+                    cursor.execute(query_stats, tuple(scope_params))
 
                     stats = cursor.fetchone()
 
                     return jsonify({
                         "success": True,
                         "data": {
+                            "batch_id": target_batch,
                             "total_mediciones": stats["total_mediciones"],
                             "dias_activos": stats["dias_activos"],
                             "primera_medicion": stats["primera_medicion"],
